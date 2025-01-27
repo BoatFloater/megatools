@@ -1,6 +1,6 @@
 /*
  *  megatools - Mega.nz client library and tools
- *  Copyright (C) 2013  Ondřej Jirman <megous@megous.com>
+ *  Copyright (C) 2013  Ondřej Jirman <megi@xff.cz>
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -391,7 +391,7 @@ static void print_version(void)
 {
 	if (opt_version) {
 		g_print("megatools " VERSION " - command line tools for Mega.nz\n\n");
-		g_print("Written by Ondrej Jirman <megous@megous.com>, 2013-2022\n");
+		g_print("Written by Ondrej Jirman <megi@xff.cz>, 2013-2022\n");
 		g_print("Go to http://megatools.megous.com for more information\n");
 		exit(0);
 	}

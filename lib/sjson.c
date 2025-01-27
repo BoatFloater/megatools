@@ -1,6 +1,6 @@
 /**
  * sjson - fast string based JSON parser/generator library
- * Copyright (C) 2013  Ondřej Jirman <megous@megous.com>
+ * Copyright (C) 2013  Ondřej Jirman <megi@xff.cz>
  *
  * WWW: https://github.com/megous/sjson
  *
