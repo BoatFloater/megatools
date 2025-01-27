@@ -20,7 +20,7 @@ password.
 
 Mega website can be found at https://mega.nz.
 
-Megatools official website is at https://megatools.megous.com
+Megatools official website is at https://xff.cz/megatools/
 
 
 Tools
@@ -56,7 +56,7 @@ See the man pages for how to use individual tools:
 
 Man pages are also available online at:
 
-  https://megatools.megous.com/man/megatools.html
+  https://xff.cz/megatools/man/megatools.html
 
 
 Installation on Windows
@@ -64,8 +64,8 @@ Installation on Windows
 
 Official builds for 32bit and 64bit Windows are avaialbe at:
 
-  https://megatools.megous.com
-  https://megatools.megous.com/builds/experimental/
+  https://xff.cz/megatools/
+  https://xff.cz/megatools/builds/experimental/
 
 Megatools is also available on Windows via Chocolatey thanks to ERap320.
 See:
@@ -124,7 +124,7 @@ distributions like older versions of CentOS or RedHat.
 
 Static builds are available here:
 
-  https://megatools.megous.com/builds/experimental/
+  https://xff.cz/megatools/builds/experimental/
 
 
 Building megatools from source code
@@ -132,7 +132,7 @@ Building megatools from source code
 
 The official source code tarball is available at:
 
-   http://megatools.megous.com/builds/
+   http://xff.cz/megatools/builds/
 
 You should check that the code was released by me by verifying PGP signatures
 provided alongside the code.
@@ -182,7 +182,7 @@ your /usr or /usr/local by using --prefix $HOME/.local option to meson.
 
 Example build steps:
 
-  wget https://megatools.megous.com/builds/megatools-1.11.0.tar.gz{,.asc}
+  wget https://xff.cz/megatools/builds/megatools-1.11.0.tar.gz{,.asc}
   gpg --verify megatools-1.11.0.tar.gz.asc
   tar xf megatools-1.11.0.tar.gz
   cd megatools-1.11.0
@@ -207,7 +207,7 @@ Megatools use meson build system. See https://mesonbuild.com/
 
 Build steps for meson are:
 
-  git clone https://megous.com/git/megatools
+  git clone https://xff.cz/git/megatools
   cd megatools
   meson setup .build
   ninja -C .build
@@ -232,12 +232,12 @@ Some third party tools can be found at:
 Author
 ======
 
-Megatools were written by Ondřej Jirman <megatools@megous.com>, 2013-2022
+Megatools were written by Ondřej Jirman <megatools@xff.cz>, 2013-2022
 
-My PGP key can be found at: https://megous.com/key.txt
+My PGP key can be found at: https://xff.cz/key.txt
   (Fingerprint is: EBFBDDE11FB918D44D1F56C1F9F0A873BE9777ED)
 
-Official website is: https://megatools.megous.com
+Official website is: https://xff.cz/megatools/
 
 
 Contributors
@@ -272,13 +272,11 @@ Contributors
 Support and bug reports
 =======================
 
-If you think you've found bug in megatools, send a report including enough
-information for recreating the issue to: megatools@megous.com Your message
-will end up in a public archive, so be careful what you say, or infomration
-you send.
+There is no support for megatools. I only accept patches and maintain reasonably
+uptodate static builds.
 
-I respond to most e-mails, so if you are not getting a response within a few
-days, check your spam folder.
+You can send patches to megatools@xff.cz if you want them integrated into
+the main code base that may end up in Linux distributions.
 
 
 License

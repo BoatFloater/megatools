@@ -45,9 +45,9 @@ servers allow. Memory requirements and CPU utilization are kept at minimum.
 You can register account using a man:megatools-reg[1] tool, with the benefit of having 
 true control of your encryption keys.
 
-Mega website can be found at http://mega.nz.
+Mega website can be found at https://mega.nz.
 
-Megatools can be downloaded at http://megatools.megous.com
+Megatools can be downloaded at https://xff.cz/megatools/
 
 
 TOOLS OVERVIEW

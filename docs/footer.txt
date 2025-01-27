@@ -21,13 +21,14 @@ Part of the man:megatools[1] suite of commands.
 BUGS
 ----
 
-Report bugs to megatools@megous.com. Your message will end up in a public
-archive, so be careful what you say or send.
+There is no upstream support for bugreports and feature requests. But you 
+can send code patches to megatools@xff.cz to get them integrated into
+upstream repository.
 
 
 AUTHOR
 ------
 
-Megatools was written by Ondrej Jirman <megatools@megous.com>, 2013-2022.
+Megatools was written by Ondrej Jirman <megatools@xff.cz>, 2013-2022.
 
-Official website is link:http://megatools.megous.com[].
+Official website is link:https://xff.cz/megatools/[].
