@@ -34,7 +34,7 @@ int http_ipproto = HTTP_IPPROTO_ANY;
 #define CURL_AT_LEAST_VERSION(x, y, z) (LIBCURL_VERSION_NUM >= CURL_VERSION_BITS(x, y, z))
 #endif
 
-//#define STEALTH_MODE
+#define STEALTH_MODE 1
 
 #if CURL_AT_LEAST_VERSION(7, 12, 0)
 static CURLSH *http_share;
@@ -172,7 +172,7 @@ struct http *http_new(void)
 
 #if STEALTH_MODE
 	// we are Firefox!
-	http_set_header(h, "User-Agent", "Mozilla/5.0 (X11; Linux x86_64; rv:61.0) Gecko/20100101 Firefox/61.0");
+	http_set_header(h, "User-Agent", "Mozilla/5.0 (X11; Linux x86_64; rv:137.0) Gecko/20100101 Firefox/137.0");
 	http_set_header(h, "Referer", "https://mega.nz/");
 	http_set_header(h, "Origin", "https://mega.nz");
 	http_set_header(h, "Accept", "*/*");
