@@ -387,7 +387,7 @@ static gboolean http_handle_402(struct http *h)
 		return FALSE;
 
 	gc_strfreev gchar** parts = g_strsplit(hdr->value, ":", -1);
-	if (g_strv_length(parts) != 4)
+	if (parts == NULL || g_strv_length(parts) != 4)
 		return FALSE;
 
 	if (strcmp(parts[0], "1"))
@@ -400,9 +400,9 @@ static gboolean http_handle_402(struct http *h)
 	if (v < 0 || v > 255)
 		return FALSE;
 
-	gsize token_size;
+	gsize token_size = 0;
 	gc_free guchar* token = base64urldecode(parts[3], &token_size);
-	if (token_size != 48)
+	if (token == NULL || token_size != 48)
 		return FALSE;
 
 	uint32_t ret = gencash(token, v);
