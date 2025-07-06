@@ -1,3 +1,12 @@
+megatools 1.11.5 - 2025-07-06
+=============================
+
+This release implements mega.nz X-Hashcash to handle 402 status responses
+as suggested by a user.
+
+This should handle 402 errors returned by mega.nz.
+
+
 megatools 1.11.3 - 2025-02-03
 =============================
 
