@@ -360,7 +360,7 @@ static uint32_t gencash(const char token[48], uint32_t easiness)
 			goto out;
 
 		// BE 32 bit number at start of hash must be <= threshold
-		if (be32toh(*(uint32_t*)hash) <= threshold) {
+		if (GUINT32_FROM_BE(*(uint32_t*)hash) <= threshold) {
 			ret = *prefix;
 			goto out;
 		}
