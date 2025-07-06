@@ -279,7 +279,7 @@ static void s_json_gen_member_rsa_key(SJsonGen *gen, const gchar *name, struct r
 // }}}
 // {{{ base64urlencode
 
-static gchar *base64urlencode(const guchar *data, gsize len)
+gchar *base64urlencode(const guchar *data, gsize len)
 {
 	gint i, shl;
 	gchar *she, *p;
@@ -311,7 +311,7 @@ static gchar *base64urlencode(const guchar *data, gsize len)
 // }}}
 // {{{ base64urldecode
 
-static guchar *base64urldecode(const gchar *str, gsize *len)
+guchar *base64urldecode(const gchar *str, gsize *len)
 {
 	gint i;
 

@@ -20,8 +20,11 @@
 #include "http.h"
 #include "mega.h"
 #include "config.h"
+#include "alloc.h"
+
 #include <curl/curl.h>
 #include <string.h>
+#include <openssl/evp.h>
 
 char* http_netif = NULL;
 int http_ipproto = HTTP_IPPROTO_ANY;
@@ -323,6 +326,97 @@ static gboolean to_error(struct http* h, CURLcode res, GError** err)
 	return TRUE;
 }
 
+gchar *base64urlencode(const guchar *data, gsize len);
+guchar *base64urldecode(const gchar *str, gsize *len);
+
+static uint32_t gencash(const char token[48], uint32_t easiness)
+{
+	uint8_t *buf;
+	const size_t buf_size = 4 + 262144 * 48;
+	uint32_t ret = 0xffffffffu;
+	uint32_t threshold = ((easiness & 63) << 1) + 1 << (easiness >> 6) * 7 + 3;
+
+	buf = g_malloc(buf_size);
+	for (int i = 0; i < 262144; i++)
+		memcpy(buf + 4 + i * 48, token, 48);
+	memset(buf, 0, 4);
+	uint32_t *prefix = (void*)buf;
+
+	EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+
+	while (1) {
+		*prefix += 1;
+
+		if (!EVP_DigestInit_ex(ctx, EVP_sha256(), NULL))
+			goto out;
+
+		if (!EVP_DigestUpdate(ctx, buf, buf_size))
+			goto out;
+
+		unsigned char hash[EVP_MAX_MD_SIZE];
+		unsigned int hash_size = 0;
+
+		if (!EVP_DigestFinal_ex(ctx, hash, &hash_size))
+			goto out;
+
+		// BE 32 bit number at start of hash must be <= threshold
+		if (be32toh(*(uint32_t*)hash) <= threshold) {
+			ret = *prefix;
+			goto out;
+		}
+	}
+
+out:
+	EVP_MD_CTX_free(ctx);
+	g_free(buf);
+	return ret;
+}
+
+static gboolean http_handle_402(struct http *h)
+{
+	glong http_status = 0;
+
+	if (curl_easy_getinfo(h->curl, CURLINFO_RESPONSE_CODE, &http_status) != CURLE_OK)
+		return FALSE;
+	if (http_status != 402)
+		return FALSE;
+
+	struct curl_header *hdr = NULL;
+	CURLHcode hh = curl_easy_header(h->curl, "X-Hashcash", 0, CURLH_HEADER, -1, &hdr);
+	if (hh != CURLHE_OK)
+		return FALSE;
+
+	gc_strfreev gchar** parts = g_strsplit(hdr->value, ":", -1);
+	if (g_strv_length(parts) != 4)
+		return FALSE;
+
+	if (strcmp(parts[0], "1"))
+		return FALSE;
+
+	gchar* np = NULL;
+	gint64 v = g_ascii_strtoll(parts[1], &np, 10);
+	if (v == 0 && np == parts[1])
+		return FALSE;
+	if (v < 0 || v > 255)
+		return FALSE;
+
+	gsize token_size;
+	gc_free guchar* token = base64urldecode(parts[3], &token_size);
+	if (token_size != 48)
+		return FALSE;
+
+	uint32_t ret = gencash(token, v);
+	if (ret == 0xffffffffu)
+		return FALSE;
+
+	gc_free gchar* str = base64urlencode((gchar*)&ret, 4);
+
+	gc_free gchar* res = g_strdup_printf("1:%s:%s", parts[3], str);
+	http_set_header(h, "X-Hashcash", res);
+
+	return TRUE;
+}
+
 GString *http_post(struct http *h, const gchar *url, const gchar *body, gssize body_len, GError **err)
 {
 	struct curl_slist *headers = NULL;
@@ -355,11 +449,26 @@ GString *http_post(struct http *h, const gchar *url, const gchar *body, gssize b
 	curl_easy_setopt(h->curl, CURLOPT_WRITEFUNCTION, (curl_write_callback)append_gstring);
 	curl_easy_setopt(h->curl, CURLOPT_WRITEDATA, response);
 
-	// perform HTTP request
-	res = curl_easy_perform(h->curl);
-	if (to_error(h, res, err)) {
-		g_string_free(response, TRUE);
-		response = NULL;
+	int tries = 0;
+	while (tries++ < 4) {
+		// perform HTTP request
+		res = curl_easy_perform(h->curl);
+
+		if (res == CURLE_OK && http_handle_402(h)) {
+			// re-create request headers list
+			curl_slist_free_all(headers);
+			headers = NULL;
+			g_hash_table_foreach(h->headers, (GHFunc)add_header, &headers);
+			curl_easy_setopt(h->curl, CURLOPT_HTTPHEADER, headers);
+			continue;
+		}
+
+		if (to_error(h, res, err)) {
+			g_string_free(response, TRUE);
+			response = NULL;
+		}
+
+		break;
 	}
 
 	curl_easy_setopt(h->curl, CURLOPT_HTTPHEADER, NULL);
