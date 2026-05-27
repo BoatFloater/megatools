@@ -60,6 +60,7 @@ void http_set_header(struct http *h, const gchar *name, const gchar *value);
 void http_set_progress_callback(struct http *h, http_progress_fn cb, gpointer data);
 void http_set_speed(struct http *h, gint max_ul, gint max_dl);
 void http_set_proxy(struct http *h, const gchar *proxy);
+void http_disable_pinning(struct http *h);
 
 GString *http_post(struct http *h, const gchar *url, const gchar *body, gssize body_len, GError **err);
 GString *http_post_stream_upload(struct http *h, const gchar *url, goffset len, http_data_fn read_cb,

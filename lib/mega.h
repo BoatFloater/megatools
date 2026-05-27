@@ -70,10 +70,8 @@ enum {
 	MEGA_NODE_FILE = 0,
 	MEGA_NODE_FOLDER = 1,
 	MEGA_NODE_ROOT = 2,
-	MEGA_NODE_INBOX = 3,
 	MEGA_NODE_TRASH = 4,
-	MEGA_NODE_NETWORK = 9,
-	MEGA_NODE_CONTACT = 8
+	MEGA_NODE_SHARED = 10
 };
 
 struct mega_share_key {
@@ -93,6 +91,7 @@ struct mega_node {
 	gint type;
 	guint64 size;
 	glong timestamp;
+	gint access_level; // 0=unknown, 1=read, 2=readwrite, 3=full, 4=owner
 
 	// call addlinks after refresh to get links populated
 	gchar *link;

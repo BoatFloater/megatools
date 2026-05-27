@@ -27,15 +27,14 @@ You need to be aware of several special folders:
 	Trash directory where Mega.nz web client moves deleted files. This
 	directory is not used by megatools when removing files.
 
-/Inbox::
-	Not sure.
+/Shared::
+	Directory containing folders that others have shared with you (incoming
+	shares). Each subdirectory under /Shared represents a folder shared by
+	another user. Access permissions (read-only or read-write) depend on
+	what the share owner granted you.
 
-/Contacts::
-	Directory containing subdirectories representing your contacts list. If
-	you want to add contacts to the list, simply create subdirectory named
-	after the contact you want to add.
-
-/Contacts/<email>::
-	Directories representing individual contacts in your contacts list. These
-	directories contain folders that others shared with you. All shared
-	files are read-only, at the moment.
+/Shared/<foldername>::
+	Directories representing individual incoming shared folders. These may
+	be read-only or read-write depending on the share permissions set by
+	their owner. Files within can be downloaded; uploading is only allowed
+	if the share has write access.

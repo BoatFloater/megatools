@@ -63,7 +63,6 @@ const struct shell_tool shell_tool_rm = {
 	.main = rm_main,
 	.usages = (char*[]){
 		"<remotepaths>...",
-		"/Contacts/<contactemail>",
 		NULL
 	},
 };

@@ -1,5 +1,5 @@
 project('megatools', 'c',
-  version: '1.11.5',
+  version: '1.12.0',
   default_options: [
     'c_std=gnu99',
   ],

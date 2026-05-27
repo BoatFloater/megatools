@@ -64,7 +64,6 @@ const struct shell_tool shell_tool_mkdir = {
 	.main = mkdir_main,
 	.usages = (char*[]){
 		"<remotepaths>...",
-		"/Contacts/<contactemail>",
 		NULL
 	},
 };

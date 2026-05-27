@@ -1,3 +1,55 @@
+megatools 1.12.0 - 2026-05-27
+=============================
+
+This is a major update that brings megatools up to date with the modern mega.nz
+protocol and encryption standards. The mega.nz protocol evolved significantly
+since 2013 while remaining backwards compatible; this release adds support for
+all the additive changes made over the past decade.
+
+New features:
+
+- ^!keys (KeyManager) support. Modern mega.nz accounts store all cryptographic
+  keys, share keys, and authrings in a centralised ^!keys attribute encrypted
+  with AES-GCM. Megatools now fetches, decrypts, and uses ^!keys for all key
+  management operations.
+
+- Ed25519 and x25519 (Curve25519) key support. Used for contact verification
+  (Ed25519 signatures) and pairwise key exchange (ECDH).
+
+- Authring verification (TOFU model). Contact public keys are verified against
+  stored fingerprints on first encounter. Subsequent encounters check the
+  fingerprint matches. Cu25519 keys are additionally verified via Ed25519
+  signatures when available. Violations are reported as warnings.
+
+- Incoming shared folders are now listed under /Shared in the virtual
+  filesystem, e.g. /Shared/foldername, matching the mega.nz webclient layout.
+
+- Share key propagation for uploads. When uploading files or creating
+  directories inside shared folders, the node key is encrypted with the
+  folder's share key via a cr array in the putnodes command.
+  Other share members can now decrypt files uploaded by megatools.
+
+- Access level enforcement for shared folders. Read-only shares reject uploads
+  and deletions. Read-write shares allow adding new files but block deletion
+  of files owned by others. Full-access shares allow all operations.
+
+Improvements:
+
+- Session cache encryption upgraded from AES-CBC (zero IV, no authentication)
+  to AES-GCM (random 12-byte IV, 16-byte authentication tag). Cache format
+  version bumped to 6. Old caches are automatically invalidated.
+
+- Duplicate nodes from the mega.nz API are now silently deduplicated instead
+  of producing warnings.
+
+- /Inbox and /Contacts virtual directories removed from the VFS. Contact
+  management via mkdir/rm under /Contacts is no longer supported.
+
+- Upload and download connections use system CA certificates instead of the
+  API server's pinned key. Previously megatools did not user TLS for
+  upload/download server connections, avoiding double-encryption.
+
+
 megatools 1.11.5 - 2025-07-06
 =============================
 

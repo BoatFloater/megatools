@@ -19,6 +19,10 @@ Uploads files to your Mega.nz account.
 
 *NOTE*: If you want to upload entire directories, use man:megatools-copy[1].
 
+*NOTE*: Uploading to shared folders under /Shared is only possible if the
+share owner granted you write access. Read-only shares will be rejected
+with an error.
+
 
 OPTIONS
 -------

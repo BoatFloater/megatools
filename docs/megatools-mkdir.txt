@@ -10,16 +10,12 @@ SYNOPSIS
 --------
 [verse]
 'megatools mkdir' <remotepaths>...
-'megatools mkdir' /Contacts/<contactemail>
 
 
 DESCRIPTION
 -----------
 
 Creates folders on Mega.nz.
-
-As a special case, by creating a new folder under /Contacts, you're adding
-a `<contactemail>` to your contacts list.
 
 
 OPTIONS
@@ -30,9 +26,6 @@ include::basic-options.txt[]
 
 <remotepaths>::
 	One or more remote directories to create.
-
-<contactemail>::
-	Valid email address of a contact you want to add.
 
 
 EXAMPLES
@@ -45,13 +38,6 @@ $ megatools mkdir /Root/MyNewFolder
 $ megatools ls /Root
 /Root
 /Root/MyNewFolder
-------------
-
-
-* Add new contact to your contacts list:
-+
-------------
-$ megatools mkdir /Contacts/some@email.com
 ------------
 
 

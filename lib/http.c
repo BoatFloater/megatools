@@ -254,6 +254,15 @@ void http_set_proxy(struct http *h, const gchar *proxy)
 	curl_easy_setopt(h->curl, CURLOPT_PROXY, proxy);
 }
 
+void http_disable_pinning(struct http *h)
+{
+	// Remove public key pinning
+	curl_easy_setopt(h->curl, CURLOPT_PINNEDPUBLICKEY, NULL);
+	// Restore proper SSL peer verification using system CA
+	curl_easy_setopt(h->curl, CURLOPT_SSL_VERIFYPEER, 1L);
+	curl_easy_setopt(h->curl, CURLOPT_CAINFO, "/etc/ssl/certs/ca-certificates.crt");
+}
+
 void http_set_progress_callback(struct http *h, http_progress_fn cb, gpointer data)
 {
 	if (cb) {
@@ -334,7 +343,7 @@ static uint32_t gencash(const char token[48], uint32_t easiness)
 	uint8_t *buf;
 	const size_t buf_size = 4 + 262144 * 48;
 	uint32_t ret = 0xffffffffu;
-	uint32_t threshold = ((easiness & 63) << 1) + 1 << (easiness >> 6) * 7 + 3;
+	uint32_t threshold = (((easiness & 63) << 1) + 1) << ((easiness >> 6) * 7 + 3);
 
 	buf = g_malloc(buf_size);
 	for (int i = 0; i < 262144; i++)

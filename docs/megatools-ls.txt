@@ -78,11 +78,11 @@ EXAMPLES
 ------------
 $ megatools ls
 
-/Contacts
-/Inbox
 /Root
 /Root/README
 /Root/bigfile
+/Shared
+/Shared/Photos
 /Trash
 ------------
 

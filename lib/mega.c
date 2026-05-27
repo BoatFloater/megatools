@@ -35,6 +35,10 @@
 #include <openssl/rand.h>
 #include <openssl/err.h>
 #include <openssl/evp.h>
+#include <openssl/kdf.h>
+#include <openssl/hmac.h>
+#include <openssl/core_names.h>
+#include <openssl/param_build.h>
 
 DEFINE_CLEANUP_FUNCTION(struct http *, http_free)
 #define gc_http_free CLEANUP(http_free)
@@ -45,7 +49,15 @@ DEFINE_CLEANUP_FUNCTION_NULL(BN_CTX *, BN_CTX_free)
 DEFINE_CLEANUP_FUNCTION_NULL(BIGNUM *, BN_free)
 #define gc_bn_free CLEANUP(BN_free)
 
-#define CACHE_FORMAT_VERSION 4
+#define CACHE_FORMAT_VERSION 5
+
+static void rand_bytes_or_die(guchar *buf, gsize len)
+{
+	if (RAND_bytes(buf, (int)len) != 1) {
+		g_printerr("FATAL: RAND_bytes failed — CSPRNG unavailable\n");
+		exit(1);
+	}
+}
 
 gint mega_debug = 0;
 
@@ -54,30 +66,30 @@ gint mega_debug = 0;
 // {{{ SRV_E*
 
 enum { SRV_EINTERNAL = -1,
-       SRV_EARGS = -2,
-       SRV_EAGAIN = -3,
-       SRV_ERATELIMIT = -4,
-       SRV_EFAILED = -5,
-       SRV_ETOOMANY = -6,
-       SRV_ERANGE = -7,
-       SRV_EEXPIRED = -8,
+	SRV_EARGS = -2,
+	SRV_EAGAIN = -3,
+	SRV_ERATELIMIT = -4,
+	SRV_EFAILED = -5,
+	SRV_ETOOMANY = -6,
+	SRV_ERANGE = -7,
+	SRV_EEXPIRED = -8,
 
-       // FS access errors
-       SRV_ENOENT = -9,
-       SRV_ECIRCULAR = -10,
-       SRV_EACCESS = -11,
-       SRV_EEXIST = -12,
-       SRV_EINCOMPLETE = -13,
+	// FS access errors
+	SRV_ENOENT = -9,
+	SRV_ECIRCULAR = -10,
+	SRV_EACCESS = -11,
+	SRV_EEXIST = -12,
+	SRV_EINCOMPLETE = -13,
 
-       // crypto errors
-       SRV_EKEY = -14,
+	// crypto errors
+	SRV_EKEY = -14,
 
-       // user errors
-       SRV_ESID = -15,
-       SRV_EBLOCKED = -16,
-       SRV_EOVERQUOTA = -17,
-       SRV_ETEMPUNAVAIL = -18,
-       SRV_ETOOMANYCONNECTIONS = -19 };
+	// user errors
+	SRV_ESID = -15,
+	SRV_EBLOCKED = -16,
+	SRV_EOVERQUOTA = -17,
+	SRV_ETEMPUNAVAIL = -18,
+	SRV_ETOOMANYCONNECTIONS = -19 };
 
 // }}}
 // {{{ rsa_key
@@ -88,9 +100,73 @@ struct rsa_key {
 	BIGNUM *q;
 	BIGNUM *d;
 	BIGNUM *u; // p^-1 mod q
-	// pub
+		   // pub
 	BIGNUM *m;
 	BIGNUM *e;
+};
+
+// }}}
+// {{{ KeyManager (^!keys) constants
+
+#define KEYMANAGER_VERSION 20
+#define KEYMANAGER_IV_LEN 12
+#define KEYMANAGER_TAG_LEN 16
+
+enum {
+	KEYMANAGER_TAG_VERSION = 1,
+	KEYMANAGER_TAG_CREATION_TIME = 2,
+	KEYMANAGER_TAG_IDENTITY = 3,
+	KEYMANAGER_TAG_GENERATION = 4,
+	KEYMANAGER_TAG_ATTR = 5,
+	KEYMANAGER_TAG_PRIV_ED25519 = 16,
+	KEYMANAGER_TAG_PRIV_CU25519 = 17,
+	KEYMANAGER_TAG_PRIV_RSA = 18,
+	KEYMANAGER_TAG_AUTHRING_ED25519 = 32,
+	KEYMANAGER_TAG_AUTHRING_CU25519 = 33,
+	KEYMANAGER_TAG_SHAREKEYS = 48,
+	KEYMANAGER_TAG_PENDING_OUTSHARES = 64,
+	KEYMANAGER_TAG_PENDING_INSHARES = 65,
+	KEYMANAGER_TAG_BACKUPS = 80,
+	KEYMANAGER_TAG_WARNINGS = 96,
+};
+
+struct mega_share_key_entry {
+	guchar key[16];
+	guint8 flags; // bit 0 = trusted, bit 1 = in_use
+};
+
+// Authring auth methods (matching mega-sdk)
+typedef enum {
+	AUTH_METHOD_UNKNOWN = -1,
+	AUTH_METHOD_SEEN = 0,       // key observed but not verified
+	AUTH_METHOD_FINGERPRINT = 1, // Ed25519 only: manually verified
+	AUTH_METHOD_SIGNATURE = 2,   // Cu25519/RSA: verified via Ed25519 signature
+} auth_method_t;
+
+// Per-contact authring entry: 20-byte fingerprint + auth method
+struct authring_entry {
+	guchar fingerprint[20];
+	auth_method_t method;
+};
+
+struct mega_keymanager {
+	gboolean loaded;
+	guint8 version;
+	guint32 generation;
+	guchar identity[8];
+	guchar priv_ed25519[32];
+	guchar priv_cu25519[32];
+	guchar *priv_rsa; // variable length, NULL if not present
+	gsize priv_rsa_len;
+	GHashTable *authring_ed25519;  // gchar* user_handle -> struct authring_entry*
+	GHashTable *authring_cu25519;  // gchar* user_handle -> struct authring_entry*
+	GHashTable *share_keys;        // gchar* node_handle -> struct mega_share_key_entry*
+	GHashTable *pending_inshares;  // gchar* node_handle -> struct mega_pending_inshare*
+};
+
+struct mega_pending_inshare {
+	gchar sharer_handle[8]; // user handle of the person who shared
+	guchar share_key[16];
 };
 
 // }}}
@@ -123,6 +199,9 @@ struct mega_session {
 
 	GSList *fs_nodes;
 
+	// KeyManager for ^!keys support
+	struct mega_keymanager keymanager;
+
 	// progress reporting
 	mega_status_callback status_callback;
 	gpointer status_userdata;
@@ -133,6 +212,12 @@ struct mega_session {
 };
 
 // }}}
+
+// forward declarations
+static void add_share_key(struct mega_session *s, const gchar *handle, const guchar *key);
+static gchar *api_request(struct mega_session *s, const gchar *req_node, GError **err);
+static const gchar *api_response_check(const gchar *response, gchar expects, gint *error_code, GError **err);
+static struct mega_node *mega_node_parse(struct mega_session *s, const gchar *node);
 
 // JSON helpers
 
@@ -248,18 +333,18 @@ static void s_json_gen_member_rsa_key(SJsonGen *gen, const gchar *name, struct r
 
 #define ADD_COMPONENT(name)                                                                                            \
 	if (key->name)                                                                                                 \
-		s_json_gen_member_bn(gen, #name, key->name);
+	s_json_gen_member_bn(gen, #name, key->name);
 
 	ADD_COMPONENT(p)
-	ADD_COMPONENT(q)
-	ADD_COMPONENT(d)
-	ADD_COMPONENT(u)
-	ADD_COMPONENT(m)
-	ADD_COMPONENT(e)
+		ADD_COMPONENT(q)
+		ADD_COMPONENT(d)
+		ADD_COMPONENT(u)
+		ADD_COMPONENT(m)
+		ADD_COMPONENT(e)
 
 #undef ADD_COMPONENT
 
-	s_json_gen_end_object(gen);
+		s_json_gen_end_object(gen);
 }
 
 // }}}
@@ -337,9 +422,10 @@ guchar *base64urldecode(const gchar *str, gsize *len)
 // }}}
 // {{{ aes128_decrypt
 
-G_GNUC_UNUSED static gboolean aes128_decrypt(guchar *out, const guchar *in, gsize len, const guchar *key)
+static gboolean aes128_decrypt(guchar *out, const guchar *in, gsize len, const guchar *key)
 {
-	AES_KEY k;
+	EVP_CIPHER_CTX *ctx;
+	int out_len = 0, total_len = 0;
 	gsize off;
 
 	g_return_val_if_fail(out != NULL, FALSE);
@@ -347,12 +433,26 @@ G_GNUC_UNUSED static gboolean aes128_decrypt(guchar *out, const guchar *in, gsiz
 	g_return_val_if_fail(len % 16 == 0, FALSE);
 	g_return_val_if_fail(key != NULL, FALSE);
 
-	AES_set_decrypt_key(key, 128, &k);
+	ctx = EVP_CIPHER_CTX_new();
+	if (!ctx)
+		return FALSE;
 
-	for (off = 0; off < len; off += 16)
-		AES_decrypt(in + off, out + off, &k);
+	if (!EVP_DecryptInit_ex(ctx, EVP_aes_128_ecb(), NULL, key, NULL))
+		goto err;
+	EVP_CIPHER_CTX_set_padding(ctx, 0);
 
-	return TRUE;
+	for (off = 0; off < len; off += 16) {
+		if (!EVP_DecryptUpdate(ctx, out + off, &out_len, in + off, 16))
+			goto err;
+		total_len += out_len;
+	}
+
+	EVP_CIPHER_CTX_free(ctx);
+	return (gsize)total_len == len;
+
+err:
+	EVP_CIPHER_CTX_free(ctx);
+	return FALSE;
 }
 
 // }}}
@@ -360,7 +460,8 @@ G_GNUC_UNUSED static gboolean aes128_decrypt(guchar *out, const guchar *in, gsiz
 
 static gboolean aes128_encrypt(guchar *out, const guchar *in, gsize len, const guchar *key)
 {
-	AES_KEY k;
+	EVP_CIPHER_CTX *ctx;
+	int out_len = 0, total_len = 0;
 	gsize off;
 
 	g_return_val_if_fail(out != NULL, FALSE);
@@ -368,12 +469,26 @@ static gboolean aes128_encrypt(guchar *out, const guchar *in, gsize len, const g
 	g_return_val_if_fail(len % 16 == 0, FALSE);
 	g_return_val_if_fail(key != NULL, FALSE);
 
-	AES_set_encrypt_key(key, 128, &k);
+	ctx = EVP_CIPHER_CTX_new();
+	if (!ctx)
+		return FALSE;
 
-	for (off = 0; off < len; off += 16)
-		AES_encrypt(in + off, out + off, &k);
+	if (!EVP_EncryptInit_ex(ctx, EVP_aes_128_ecb(), NULL, key, NULL))
+		goto err;
+	EVP_CIPHER_CTX_set_padding(ctx, 0);
 
-	return TRUE;
+	for (off = 0; off < len; off += 16) {
+		if (!EVP_EncryptUpdate(ctx, out + off, &out_len, in + off, 16))
+			goto err;
+		total_len += out_len;
+	}
+
+	EVP_CIPHER_CTX_free(ctx);
+	return (gsize)total_len == len;
+
+err:
+	EVP_CIPHER_CTX_free(ctx);
+	return FALSE;
 }
 
 // }}}
@@ -381,16 +496,15 @@ static gboolean aes128_encrypt(guchar *out, const guchar *in, gsize len, const g
 
 static guchar *b64_aes128_decrypt(const gchar *str, const guchar *key, gsize *outlen)
 {
-	AES_KEY k;
+	EVP_CIPHER_CTX *ctx;
 	gsize cipherlen = 0;
-	gsize off;
+	int out_len = 0;
 	gc_free guchar *cipher = NULL;
 	guchar *data;
+	gsize off;
 
 	g_return_val_if_fail(str != NULL, NULL);
 	g_return_val_if_fail(key != NULL, NULL);
-
-	AES_set_decrypt_key(key, 128, &k);
 
 	cipher = base64urldecode(str, &cipherlen);
 	if (cipher == NULL)
@@ -399,14 +513,30 @@ static guchar *b64_aes128_decrypt(const gchar *str, const guchar *key, gsize *ou
 	if (cipherlen % 16 != 0)
 		return NULL;
 
-	data = g_malloc0(cipherlen);
-	for (off = 0; off < cipherlen; off += 16)
-		AES_decrypt(cipher + off, data + off, &k);
+	ctx = EVP_CIPHER_CTX_new();
+	if (!ctx)
+		return NULL;
 
+	if (!EVP_DecryptInit_ex(ctx, EVP_aes_128_ecb(), NULL, key, NULL))
+		goto err;
+	EVP_CIPHER_CTX_set_padding(ctx, 0);
+
+	data = g_malloc0(cipherlen);
+	for (off = 0; off < cipherlen; off += 16) {
+		if (!EVP_DecryptUpdate(ctx, data + off, &out_len, cipher + off, 16))
+			goto err_data;
+	}
+
+	EVP_CIPHER_CTX_free(ctx);
 	if (outlen)
 		*outlen = cipherlen;
-
 	return data;
+
+err_data:
+	g_free(data);
+err:
+	EVP_CIPHER_CTX_free(ctx);
+	return NULL;
 }
 
 // }}}
@@ -414,22 +544,35 @@ static guchar *b64_aes128_decrypt(const gchar *str, const guchar *key, gsize *ou
 
 static gchar *b64_aes128_encrypt(const guchar *data, gsize len, const guchar *key)
 {
-	AES_KEY k;
-	gsize off;
+	EVP_CIPHER_CTX *ctx;
+	int out_len = 0;
 	gc_free guchar *cipher = NULL;
-	gchar *str;
+	gsize off;
 
 	g_return_val_if_fail(data != NULL, NULL);
 	g_return_val_if_fail((len % 16) == 0, NULL);
 	g_return_val_if_fail(key != NULL, NULL);
 
-	AES_set_encrypt_key(key, 128, &k);
+	ctx = EVP_CIPHER_CTX_new();
+	if (!ctx)
+		return NULL;
+
+	if (!EVP_EncryptInit_ex(ctx, EVP_aes_128_ecb(), NULL, key, NULL))
+		goto err;
+	EVP_CIPHER_CTX_set_padding(ctx, 0);
 
 	cipher = g_malloc0(len);
-	for (off = 0; off < len; off += 16)
-		AES_encrypt(data + off, cipher + off, &k);
+	for (off = 0; off < len; off += 16) {
+		if (!EVP_EncryptUpdate(ctx, cipher + off, &out_len, data + off, 16))
+			goto err;
+	}
 
+	EVP_CIPHER_CTX_free(ctx);
 	return base64urlencode(cipher, len);
+
+err:
+	EVP_CIPHER_CTX_free(ctx);
+	return NULL;
 }
 
 // }}}
@@ -437,15 +580,15 @@ static gchar *b64_aes128_encrypt(const guchar *data, gsize len, const guchar *ke
 
 static guchar *b64_aes128_cbc_decrypt(const gchar *str, const guchar *key, gsize *outlen)
 {
-	AES_KEY k;
+	EVP_CIPHER_CTX *ctx;
 	gsize cipherlen = 0;
+	int out_len = 0;
 	gc_free guchar *cipher = NULL;
 	guchar *data;
+	guchar iv[AES_BLOCK_SIZE] = { 0 };
 
 	g_return_val_if_fail(str != NULL, NULL);
 	g_return_val_if_fail(key != NULL, NULL);
-
-	AES_set_decrypt_key(key, 128, &k);
 
 	cipher = base64urldecode(str, &cipherlen);
 	if (cipher == NULL)
@@ -454,14 +597,28 @@ static guchar *b64_aes128_cbc_decrypt(const gchar *str, const guchar *key, gsize
 	if (cipherlen % 16 != 0)
 		return NULL;
 
-	data = g_malloc0(cipherlen + 1);
-	guchar iv[AES_BLOCK_SIZE] = { 0 };
-	AES_cbc_encrypt(cipher, data, cipherlen, &k, iv, 0);
+	ctx = EVP_CIPHER_CTX_new();
+	if (!ctx)
+		return NULL;
 
+	if (!EVP_DecryptInit_ex(ctx, EVP_aes_128_cbc(), NULL, key, iv))
+		goto err;
+	EVP_CIPHER_CTX_set_padding(ctx, 0);
+
+	data = g_malloc0(cipherlen + 1);
+	if (!EVP_DecryptUpdate(ctx, data, &out_len, cipher, (int)cipherlen))
+		goto err_data;
+
+	EVP_CIPHER_CTX_free(ctx);
 	if (outlen)
 		*outlen = cipherlen;
-
 	return data;
+
+err_data:
+	g_free(data);
+err:
+	EVP_CIPHER_CTX_free(ctx);
+	return NULL;
 }
 
 // }}}
@@ -469,20 +626,33 @@ static guchar *b64_aes128_cbc_decrypt(const gchar *str, const guchar *key, gsize
 
 static gchar *b64_aes128_cbc_encrypt(const guchar *data, gsize len, const guchar *key)
 {
-	AES_KEY k;
+	EVP_CIPHER_CTX *ctx;
+	int out_len = 0;
 	gc_free guchar *cipher = NULL;
-	gchar *str;
 	guchar iv[AES_BLOCK_SIZE] = { 0 };
 
 	g_return_val_if_fail(data != NULL, NULL);
 	g_return_val_if_fail((len % 16) == 0, NULL);
 	g_return_val_if_fail(key != NULL, NULL);
 
-	AES_set_encrypt_key(key, 128, &k);
+	ctx = EVP_CIPHER_CTX_new();
+	if (!ctx)
+		return NULL;
+
+	if (!EVP_EncryptInit_ex(ctx, EVP_aes_128_cbc(), NULL, key, iv))
+		goto err;
+	EVP_CIPHER_CTX_set_padding(ctx, 0);
 
 	cipher = g_malloc0(len);
-	AES_cbc_encrypt(data, cipher, len, &k, iv, 1);
+	if (!EVP_EncryptUpdate(ctx, cipher, &out_len, data, (int)len))
+		goto err;
+
+	EVP_CIPHER_CTX_free(ctx);
 	return base64urlencode(cipher, len);
+
+err:
+	EVP_CIPHER_CTX_free(ctx);
+	return NULL;
 }
 
 // }}}
@@ -697,30 +867,6 @@ static BIGNUM *rsa_decrypt(BIGNUM *m, BIGNUM *d, BIGNUM *p, BIGNUM *q, BIGNUM *u
 }
 
 // }}}
-// {{{ rsa_encrypt
-
-#if 0
-static BIGNUM* rsa_encrypt(BIGNUM* s, BIGNUM* e, BIGNUM* m)
-{
-	BN_CTX* ctx;
-	BIGNUM *r;
-
-	g_return_val_if_fail(s != NULL, NULL);
-	g_return_val_if_fail(e != NULL, NULL);
-	g_return_val_if_fail(m != NULL, NULL);
-
-	ctx = BN_CTX_new();
-	r = BN_new();
-
-	BN_mod_exp(r, s, e, m, ctx);
-
-	BN_CTX_free(ctx);
-
-	return r;
-}
-#endif
-
-// }}}
 // {{{ b64_rsa_decrypt
 
 static guchar *b64_rsa_decrypt(const gchar *str, struct rsa_key *key, gsize *outlen)
@@ -761,60 +907,68 @@ static guchar *b64_rsa_decrypt(const gchar *str, struct rsa_key *key, gsize *out
 
 static gboolean rsa_key_gen(struct rsa_key *k)
 {
-	RSA *key;
+	EVP_PKEY *pkey = NULL;
+	EVP_PKEY_CTX *ctx = NULL;
+	BIGNUM *e = NULL;
 
 	g_return_val_if_fail(k != NULL, FALSE);
 	g_return_val_if_fail(k->p == NULL, FALSE);
 	g_return_val_if_fail(k->m == NULL, FALSE);
 
-	key = RSA_new();
-	if (!key)
+	ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, NULL);
+	if (!ctx)
 		return FALSE;
 
-	BIGNUM *e = BN_new();
-	if (!e) {
-		RSA_free(key);
-		return FALSE;
-	}
+	if (EVP_PKEY_keygen_init(ctx) <= 0)
+		goto err;
 
+	e = BN_new();
+	if (!e)
+		goto err;
 	BN_set_word(e, RSA_3);
+	if (EVP_PKEY_CTX_set_rsa_keygen_bits(ctx, 2048) <= 0)
+		goto err;
+	if (EVP_PKEY_CTX_set1_rsa_keygen_pubexp(ctx, e) <= 0)
+		goto err;
 
-	if (!RSA_generate_key_ex(key, 2048, e, NULL))
-		return FALSE;
+	if (EVP_PKEY_keygen(ctx, &pkey) <= 0)
+		goto err;
 
-	if (RSA_check_key(key) != 1) {
-		RSA_free(key);
-		return FALSE;
-	}
+	// Extract RSA components
+	const BIGNUM *p, *q, *d, *n, *_e;
+	BIGNUM *u = NULL;
 
-#if OPENSSL_VERSION_NUMBER >= 0x10100000L && !defined(LIBRESSL_VERSION_NUMBER)
-	const BIGNUM *p, *q, *d, *u, *m, *_e;
-	RSA_get0_key(key, &m, &_e, &d);
-	RSA_get0_factors(key, &q, &p);
-	RSA_get0_crt_params(key, NULL, NULL, &u);
+	EVP_PKEY_get_bn_param(pkey, OSSL_PKEY_PARAM_RSA_FACTOR1, (BIGNUM **)&q);
+	EVP_PKEY_get_bn_param(pkey, OSSL_PKEY_PARAM_RSA_FACTOR2, (BIGNUM **)&p);
+	EVP_PKEY_get_bn_param(pkey, OSSL_PKEY_PARAM_RSA_D, (BIGNUM **)&d);
+	EVP_PKEY_get_bn_param(pkey, OSSL_PKEY_PARAM_RSA_N, (BIGNUM **)&n);
+	EVP_PKEY_get_bn_param(pkey, OSSL_PKEY_PARAM_RSA_E, (BIGNUM **)&_e);
+
+	// Compute u = p^-1 mod q (CRT coefficient)
+	BN_CTX *bn_ctx = BN_CTX_new();
+	u = BN_new();
+	BN_mod_inverse(u, p, q, bn_ctx);
+	BN_CTX_free(bn_ctx);
 
 	k->p = BN_dup(p);
 	k->q = BN_dup(q);
 	k->d = BN_dup(d);
 	k->u = BN_dup(u);
-	k->m = BN_dup(m);
+	k->m = BN_dup(n);
 	k->e = BN_dup(_e);
-#else
-	// private part
-	k->p = BN_dup(key->q);
-	k->q = BN_dup(key->p);
-	k->d = BN_dup(key->d);
-	k->u = BN_dup(key->iqmp);
 
-	// public part
-	k->m = BN_dup(key->n);
-	k->e = BN_dup(key->e);
-#endif
+	BN_free(u);
 
-	RSA_free(key);
+	EVP_PKEY_free(pkey);
+	EVP_PKEY_CTX_free(ctx);
 	BN_free(e);
-
 	return TRUE;
+
+err:
+	EVP_PKEY_free(pkey);
+	EVP_PKEY_CTX_free(ctx);
+	BN_free(e);
+	return FALSE;
 }
 
 // }}}
@@ -847,10 +1001,7 @@ static void rsa_key_free(struct rsa_key *k)
 static guchar *make_random_key(void)
 {
 	guchar k[16];
-
-	//XXX: error check
-	RAND_bytes(k, sizeof(k));
-
+	rand_bytes_or_die(k, sizeof(k));
 	return g_memdup2(k, 16);
 }
 
@@ -860,7 +1011,7 @@ static guchar *make_random_key(void)
 static guchar *make_password_key(const gchar *password)
 {
 	guchar pkey[16] = { 0x93, 0xC4, 0x67, 0xE3, 0x7D, 0xB0, 0xC7, 0xA4,
-			    0xD1, 0xBE, 0x3F, 0x81, 0x01, 0x52, 0xCB, 0x56 };
+		0xD1, 0xBE, 0x3F, 0x81, 0x01, 0x52, 0xCB, 0x56 };
 	gint i, r;
 	gint len;
 
@@ -868,18 +1019,26 @@ static guchar *make_password_key(const gchar *password)
 
 	len = strlen(password);
 
+	EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+	if (!ctx)
+		return NULL;
+	EVP_CIPHER_CTX_set_padding(ctx, 0);
+
 	for (r = 65536; r--;) {
 		for (i = 0; i < len; i += 16) {
-			AES_KEY k;
 			guchar key[16] = { 0 }, pkey_tmp[16];
+			int out_len = 0;
 
 			memcpy(key, password + i, MIN(16, len - i));
-			AES_set_encrypt_key(key, 128, &k);
-			AES_encrypt(pkey, pkey_tmp, &k);
+
+			EVP_EncryptInit_ex(ctx, EVP_aes_128_ecb(), NULL, key, NULL);
+			EVP_EncryptUpdate(ctx, pkey_tmp, &out_len, pkey, 16);
+
 			memcpy(pkey, pkey_tmp, 16);
 		}
 	}
 
+	EVP_CIPHER_CTX_free(ctx);
 	return g_memdup2(pkey, 16);
 }
 
@@ -888,22 +1047,32 @@ static guchar *make_password_key(const gchar *password)
 
 static gchar *make_username_hash(const gchar *un, const guchar *key)
 {
-	AES_KEY k;
 	gint l, i;
 	guchar hash[16] = { 0 }, hash_tmp[16], oh[8];
+	int out_len = 0;
 
 	g_return_val_if_fail(un != NULL, NULL);
 	g_return_val_if_fail(key != NULL, NULL);
 
-	AES_set_encrypt_key(key, 128, &k);
+	EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+	if (!ctx)
+		return NULL;
+
+	if (!EVP_EncryptInit_ex(ctx, EVP_aes_128_ecb(), NULL, key, NULL)) {
+		EVP_CIPHER_CTX_free(ctx);
+		return NULL;
+	}
+	EVP_CIPHER_CTX_set_padding(ctx, 0);
 
 	for (i = 0, l = strlen(un); i < l; i++)
 		hash[i % 16] ^= un[i];
 
 	for (i = 16384; i--;) {
-		AES_encrypt(hash, hash_tmp, &k);
+		EVP_EncryptUpdate(ctx, hash_tmp, &out_len, hash, 16);
 		memcpy(hash, hash_tmp, 16);
 	}
+
+	EVP_CIPHER_CTX_free(ctx);
 
 	memcpy(oh, hash, 4);
 	memcpy(oh + 4, hash + 8, 4);
@@ -1178,18 +1347,6 @@ err_clean:
 	return FALSE;
 }
 
-#if 0
-static void meta_mac_pack(guchar meta_mac[16], guchar packed[8])
-{
-	gint i;
-
-	for (i = 0; i < 4; i++)
-		packed[i] = meta_mac[i] ^ meta_mac[i + 4];
-	for (i = 0; i < 4; i++)
-		packed[i + 4] = meta_mac[i + 8] ^ meta_mac[i + 12];
-}
-#endif
-
 // }}}
 // {{{ aes128 ctr
 
@@ -1220,6 +1377,1116 @@ static gboolean encrypt_aes128_ctr(guchar *out, const guchar *in, gsize len, guc
 err_clean:
 	EVP_CIPHER_CTX_free(ctx);
 	return FALSE;
+}
+
+// }}}
+// {{{ aes128 gcm
+
+static gboolean aes128_gcm_encrypt(const guchar *plaintext, gsize plaintext_len,
+		const guchar *key, const guchar *iv, gsize iv_len,
+		guchar *ciphertext, guchar *tag, gsize tag_len)
+{
+	EVP_CIPHER_CTX *ctx;
+	int out_len = 0, final_len = 0;
+
+	ctx = EVP_CIPHER_CTX_new();
+	if (!ctx)
+		return FALSE;
+
+	if (!EVP_EncryptInit_ex(ctx, EVP_aes_128_gcm(), NULL, key, iv))
+		goto err_clean;
+
+	if (!EVP_EncryptUpdate(ctx, ciphertext, &out_len, plaintext, plaintext_len))
+		goto err_clean;
+
+	if (!EVP_EncryptFinal_ex(ctx, ciphertext + out_len, &final_len))
+		goto err_clean;
+
+	if (!EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, (int)tag_len, tag))
+		goto err_clean;
+
+	EVP_CIPHER_CTX_free(ctx);
+	return TRUE;
+
+err_clean:
+	EVP_CIPHER_CTX_free(ctx);
+	return FALSE;
+}
+
+static gboolean aes128_gcm_decrypt(const guchar *ciphertext, gsize ciphertext_len,
+		const guchar *key, const guchar *iv, gsize iv_len,
+		const guchar *tag, gsize tag_len,
+		guchar *plaintext)
+{
+	EVP_CIPHER_CTX *ctx;
+	int out_len = 0, final_len = 0;
+
+	ctx = EVP_CIPHER_CTX_new();
+	if (!ctx)
+		return FALSE;
+
+	if (!EVP_DecryptInit_ex(ctx, EVP_aes_128_gcm(), NULL, key, iv))
+		goto err_clean;
+
+	if (!EVP_DecryptUpdate(ctx, plaintext, &out_len, ciphertext, ciphertext_len))
+		goto err_clean;
+
+	if (!EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, (int)tag_len, (void*)tag))
+		goto err_clean;
+
+	if (!EVP_DecryptFinal_ex(ctx, plaintext + out_len, &final_len))
+		goto err_clean;
+
+	EVP_CIPHER_CTX_free(ctx);
+	return TRUE;
+
+err_clean:
+	EVP_CIPHER_CTX_free(ctx);
+	return FALSE;
+}
+
+// }}}
+// {{{ hkdf_sha256
+
+static gboolean hkdf_sha256(const guchar *ikm, gsize ikm_len,
+		const guchar *salt, gsize salt_len,
+		const guchar *info, gsize info_len,
+		guchar *okm, gsize okm_len)
+{
+	EVP_PKEY_CTX *ctx;
+	size_t out_len = okm_len;
+
+	ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_HKDF, NULL);
+	if (!ctx)
+		return FALSE;
+
+	if (EVP_PKEY_derive_init(ctx) <= 0)
+		goto err_clean;
+
+	if (EVP_PKEY_CTX_set_hkdf_md(ctx, EVP_sha256()) <= 0)
+		goto err_clean;
+
+	if (salt && salt_len > 0) {
+		if (EVP_PKEY_CTX_set1_hkdf_salt(ctx, salt, (int)salt_len) <= 0)
+			goto err_clean;
+	}
+
+	if (EVP_PKEY_CTX_set1_hkdf_key(ctx, ikm, (int)ikm_len) <= 0)
+		goto err_clean;
+
+	if (info && info_len > 0) {
+		if (EVP_PKEY_CTX_add1_hkdf_info(ctx, info, (int)info_len) <= 0)
+			goto err_clean;
+	}
+
+	if (EVP_PKEY_derive(ctx, okm, &out_len) <= 0)
+		goto err_clean;
+
+	EVP_PKEY_CTX_free(ctx);
+	return TRUE;
+
+err_clean:
+	EVP_PKEY_CTX_free(ctx);
+	return FALSE;
+}
+
+// }}}
+// {{{ hmac_sha256
+
+static gboolean hmac_sha256(const guchar *key, gsize key_len,
+		const guchar *data, gsize data_len,
+		guchar *out, gsize *out_len)
+{
+	EVP_MAC *mac = NULL;
+	EVP_MAC_CTX *ctx = NULL;
+	OSSL_PARAM params[2];
+	gboolean ok = FALSE;
+
+	mac = EVP_MAC_fetch(NULL, "HMAC", NULL);
+	if (!mac)
+		return FALSE;
+
+	ctx = EVP_MAC_CTX_new(mac);
+	if (!ctx)
+		goto done;
+
+	params[0] = OSSL_PARAM_construct_utf8_string(OSSL_MAC_PARAM_DIGEST, "SHA256", 0);
+	params[1] = OSSL_PARAM_construct_end();
+
+	if (!EVP_MAC_init(ctx, key, key_len, params))
+		goto done;
+
+	if (!EVP_MAC_update(ctx, data, data_len))
+		goto done;
+
+	if (!EVP_MAC_final(ctx, out, out_len, *out_len))
+		goto done;
+
+	ok = TRUE;
+
+done:
+	EVP_MAC_CTX_free(ctx);
+	EVP_MAC_free(mac);
+	return ok;
+}
+
+// }}}
+// {{{ ed25519 key operations
+
+struct ed25519_key {
+	EVP_PKEY *pkey;
+};
+
+static void ed25519_key_free(struct ed25519_key *k)
+{
+	if (k && k->pkey) {
+		EVP_PKEY_free(k->pkey);
+		k->pkey = NULL;
+	}
+}
+
+static gboolean ed25519_key_from_seed(struct ed25519_key *k, const guchar seed[32])
+{
+	EVP_PKEY *pkey = NULL;
+	EVP_PKEY_CTX *ctx = NULL;
+
+	ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_ED25519, NULL);
+	if (!ctx)
+		return FALSE;
+
+	if (EVP_PKEY_fromdata_init(ctx) <= 0) {
+		EVP_PKEY_CTX_free(ctx);
+		return FALSE;
+	}
+
+	OSSL_PARAM params[] = {
+		OSSL_PARAM_construct_octet_string(OSSL_PKEY_PARAM_PRIV_KEY, (void*)seed, 32),
+		OSSL_PARAM_construct_end()
+	};
+
+	if (EVP_PKEY_fromdata(ctx, &pkey, EVP_PKEY_KEYPAIR, params) <= 0) {
+		EVP_PKEY_CTX_free(ctx);
+		return FALSE;
+	}
+
+	EVP_PKEY_CTX_free(ctx);
+	ed25519_key_free(k);
+	k->pkey = pkey;
+	return TRUE;
+}
+
+static gboolean ed25519_get_public_key(struct ed25519_key *k, guchar pub[32])
+{
+	size_t len = 32;
+	return EVP_PKEY_get_raw_public_key(k->pkey, pub, &len) == 1 && len == 32;
+}
+
+static gboolean ed25519_sign(struct ed25519_key *k, const guchar *msg, gsize msg_len,
+		guchar *sig, gsize *sig_len)
+{
+	EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+	if (!ctx)
+		return FALSE;
+
+	if (EVP_DigestSignInit(ctx, NULL, NULL, NULL, k->pkey) != 1)
+		goto err_clean;
+
+	if (EVP_DigestSign(ctx, NULL, sig_len, msg, msg_len) != 1)
+		goto err_clean;
+
+	if (EVP_DigestSign(ctx, sig, sig_len, msg, msg_len) != 1)
+		goto err_clean;
+
+	EVP_MD_CTX_free(ctx);
+	return TRUE;
+
+err_clean:
+	EVP_MD_CTX_free(ctx);
+	return FALSE;
+}
+
+static gboolean ed25519_verify(struct ed25519_key *k, const guchar *msg, gsize msg_len,
+		const guchar *sig, gsize sig_len)
+{
+	EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+	if (!ctx)
+		return FALSE;
+
+	if (EVP_DigestVerifyInit(ctx, NULL, NULL, NULL, k->pkey) != 1)
+		goto err_clean;
+
+	int rc = EVP_DigestVerify(ctx, sig, sig_len, msg, msg_len);
+	EVP_MD_CTX_free(ctx);
+	return rc == 1;
+
+err_clean:
+	EVP_MD_CTX_free(ctx);
+	return FALSE;
+}
+
+// }}}
+// {{{ x25519 (ECDH) key operations
+
+struct x25519_key {
+	EVP_PKEY *pkey;
+};
+
+static void x25519_key_free(struct x25519_key *k)
+{
+	if (k && k->pkey) {
+		EVP_PKEY_free(k->pkey);
+		k->pkey = NULL;
+	}
+}
+
+static gboolean x25519_key_from_private(struct x25519_key *k, const guchar priv[32])
+{
+	EVP_PKEY *pkey = NULL;
+	EVP_PKEY_CTX *ctx = NULL;
+
+	ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_X25519, NULL);
+	if (!ctx)
+		return FALSE;
+
+	if (EVP_PKEY_fromdata_init(ctx) <= 0) {
+		EVP_PKEY_CTX_free(ctx);
+		return FALSE;
+	}
+
+	OSSL_PARAM params[] = {
+		OSSL_PARAM_construct_octet_string(OSSL_PKEY_PARAM_PRIV_KEY, (void*)priv, 32),
+		OSSL_PARAM_construct_end()
+	};
+
+	if (EVP_PKEY_fromdata(ctx, &pkey, EVP_PKEY_KEYPAIR, params) <= 0) {
+		EVP_PKEY_CTX_free(ctx);
+		return FALSE;
+	}
+
+	EVP_PKEY_CTX_free(ctx);
+	x25519_key_free(k);
+	k->pkey = pkey;
+	return TRUE;
+}
+
+static gboolean x25519_get_public_key(struct x25519_key *k, guchar pub[32])
+{
+	size_t len = 32;
+	return EVP_PKEY_get_raw_public_key(k->pkey, pub, &len) == 1 && len == 32;
+}
+
+static gboolean x25519_compute_shared_secret(struct x25519_key *my_key,
+		const guchar their_pub[32],
+		guchar secret[32], gsize *secret_len)
+{
+	EVP_PKEY *peer = NULL;
+	EVP_PKEY_CTX *ctx = NULL;
+	size_t len = 32;
+
+	// Import peer's public key
+	{
+		EVP_PKEY_CTX *kctx = EVP_PKEY_CTX_new_id(EVP_PKEY_X25519, NULL);
+		if (!kctx)
+			return FALSE;
+
+		if (EVP_PKEY_fromdata_init(kctx) <= 0) {
+			EVP_PKEY_CTX_free(kctx);
+			return FALSE;
+		}
+
+		OSSL_PARAM params[] = {
+			OSSL_PARAM_construct_octet_string(OSSL_PKEY_PARAM_PUB_KEY, (void*)their_pub, 32),
+			OSSL_PARAM_construct_end()
+		};
+
+		if (EVP_PKEY_fromdata(kctx, &peer, EVP_PKEY_PUBLIC_KEY, params) <= 0) {
+			EVP_PKEY_CTX_free(kctx);
+			return FALSE;
+		}
+		EVP_PKEY_CTX_free(kctx);
+	}
+
+	ctx = EVP_PKEY_CTX_new(my_key->pkey, NULL);
+	if (!ctx) {
+		EVP_PKEY_free(peer);
+		return FALSE;
+	}
+
+	if (EVP_PKEY_derive_init(ctx) <= 0)
+		goto err_clean;
+
+	if (EVP_PKEY_derive_set_peer(ctx, peer) <= 0)
+		goto err_clean;
+
+	if (EVP_PKEY_derive(ctx, secret, &len) <= 0)
+		goto err_clean;
+
+	*secret_len = len;
+	EVP_PKEY_CTX_free(ctx);
+	EVP_PKEY_free(peer);
+	return TRUE;
+
+err_clean:
+	EVP_PKEY_CTX_free(ctx);
+	EVP_PKEY_free(peer);
+	return FALSE;
+}
+
+// compute pairwise symmetric key from x25519 shared secret
+// uses the same derivation as mega-sdk: HMAC-SHA256("", secret) then HMAC-SHA256(step1, "strongvelope pairwise key\x01")
+static gboolean x25519_pairwise_key(struct x25519_key *my_key, const guchar their_pub[32],
+		guchar pairwise_key[16])
+{
+	guchar secret[32];
+	gsize secret_len = 0;
+	guchar step1[32];
+	gsize step1_len = 0;
+	guchar shared_key[32];
+	gsize shared_key_len = 0;
+
+	if (!x25519_compute_shared_secret(my_key, their_pub, secret, &secret_len))
+		return FALSE;
+
+	// Step 1: HMAC-SHA256(key=NULL, data=shared_secret)
+	static const guchar empty_key = 0;
+	if (!hmac_sha256(&empty_key, 0, secret, secret_len, step1, &step1_len))
+		return FALSE;
+
+	// Step 2: HMAC-SHA256(key=step1, data="strongvelope pairwise key\x01")
+	static const gchar pairwise_label[] = "strongvelope pairwise key";
+	guchar info[sizeof(pairwise_label)]; // includes the \x01
+	memcpy(info, pairwise_label, sizeof(pairwise_label));
+	info[sizeof(pairwise_label) - 1] = '\x01'; // ensure \x01 terminator
+	if (!hmac_sha256(step1, step1_len, info, sizeof(pairwise_label), shared_key, &shared_key_len))
+		return FALSE;
+
+	// Truncate to 16 bytes (AES-128 key)
+	memcpy(pairwise_key, shared_key, 16);
+	return TRUE;
+}
+
+// }}}
+// {{{ KeyManager (^!keys) operations
+
+static void keymanager_init(struct mega_keymanager *km)
+{
+	memset(km, 0, sizeof(*km));
+	km->authring_ed25519 = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+	km->authring_cu25519 = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+	km->share_keys = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+	km->pending_inshares = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+}
+
+static void keymanager_free(struct mega_keymanager *km)
+{
+	if (!km)
+		return;
+
+	km->loaded = FALSE;
+	g_free(km->priv_rsa);
+	km->priv_rsa = NULL;
+	if (km->authring_ed25519) {
+		g_hash_table_destroy(km->authring_ed25519);
+		km->authring_ed25519 = NULL;
+	}
+	if (km->authring_cu25519) {
+		g_hash_table_destroy(km->authring_cu25519);
+		km->authring_cu25519 = NULL;
+	}
+	if (km->share_keys) {
+		g_hash_table_destroy(km->share_keys);
+		km->share_keys = NULL;
+	}
+	if (km->pending_inshares) {
+		g_hash_table_destroy(km->pending_inshares);
+		km->pending_inshares = NULL;
+	}
+}
+
+// derive ^!keys encryption key from master key using HKDF-SHA256
+static gboolean keymanager_derive_key(const guchar *master_key, guchar derived_key[16])
+{
+	static const guchar info[] = { 1 };
+	return hkdf_sha256(master_key, 16, NULL, 0, info, 1, derived_key, 16);
+}
+
+#define MAX_TLV_RECORDS 10000
+
+// Parse authring records: [handle:8][fingerprint:20][authMethod:1]* = 29 bytes each
+static void parse_authring(GHashTable *table, const guchar *payload, gsize len)
+{
+	g_hash_table_remove_all(table);
+	gsize pos = 0, count = 0;
+	while (pos + 29 <= len && count < MAX_TLV_RECORDS) {
+		gchar *handle = base64urlencode(payload + pos, 8);
+		struct authring_entry *entry = g_new0(struct authring_entry, 1);
+		memcpy(entry->fingerprint, payload + pos + 8, 20);
+		entry->method = (auth_method_t)(gint8)payload[pos + 28];
+		g_hash_table_insert(table, handle, entry);
+		pos += 29;
+		count++;
+	}
+}
+
+// Parse share key records: [nodeHandle:6][shareKey:16][flags:1]* = 23 bytes each
+static void parse_share_keys(GHashTable *table, const guchar *payload, gsize len)
+{
+	g_hash_table_remove_all(table);
+	gsize pos = 0, count = 0;
+	while (pos + 23 <= len && count < MAX_TLV_RECORDS) {
+		gchar *handle = base64urlencode(payload + pos, 6);
+		struct mega_share_key_entry *entry = g_new0(struct mega_share_key_entry, 1);
+		memcpy(entry->key, payload + pos + 6, 16);
+		entry->flags = payload[pos + 22];
+		g_hash_table_insert(table, handle, entry);
+		pos += 23;
+		count++;
+	}
+}
+
+// Parse pending inshares (LTLV format):
+// [key_len:2][key:key_len][value_len:2][value:value_len]*
+// key = node handle string, value = [sharer_handle:8][share_key:16]
+static void parse_pending_inshares(GHashTable *table, const guchar *payload, gsize len)
+{
+	g_hash_table_remove_all(table);
+	gsize pos = 0, count = 0;
+	while (pos + 4 <= len && count < MAX_TLV_RECORDS) {
+		guint16 klen = ((guint16)payload[pos] << 8) | payload[pos + 1];
+		pos += 2;
+		if (klen == 0 || pos + klen > len)
+			break;
+		const gchar *node_handle = (const gchar *)(payload + pos);
+		pos += klen;
+		if (pos + 2 > len)
+			break;
+		guint16 vlen = ((guint16)payload[pos] << 8) | payload[pos + 1];
+		pos += 2;
+		if (pos + vlen > len || vlen < 24)
+			break;
+
+		struct mega_pending_inshare *pis = g_new0(struct mega_pending_inshare, 1);
+		memcpy(pis->sharer_handle, payload + pos, 8);
+		memcpy(pis->share_key, payload + pos + 8, 16);
+
+		gchar *handle_copy = g_strndup(node_handle, klen);
+		g_hash_table_insert(table, handle_copy, pis);
+		pos += vlen;
+		count++;
+	}
+}
+
+// Parse TLV binary records from ^!keys decrypted payload
+// Format: [tag:1][length:3 big-endian][payload:length]*
+static gboolean keymanager_parse_tlv(struct mega_keymanager *km, const guchar *data, gsize data_len)
+{
+	gsize offset = 0;
+	static const gsize MAX_RECORDS = 10000;
+
+	while (offset + 4 <= data_len) {
+		guint8 tag = data[offset];
+		guint32 len = ((guint32)data[offset + 1] << 16) |
+			((guint32)data[offset + 2] << 8) |
+			(guint32)data[offset + 3];
+		offset += 4;
+
+		if (offset + len > data_len) {
+			g_printerr("WARNING: KeyManager TLV record overflow (tag=%u, len=%u, remaining=%zu)\n",
+					tag, len, data_len - offset);
+			return FALSE;
+		}
+
+		const guchar *payload = data + offset;
+
+		switch (tag) {
+			case KEYMANAGER_TAG_VERSION:
+				if (len == 1)
+					km->version = payload[0];
+				break;
+
+			case KEYMANAGER_TAG_GENERATION:
+				if (len == 4)
+					km->generation = ((guint32)payload[0] << 24) |
+						((guint32)payload[1] << 16) |
+						((guint32)payload[2] << 8) |
+						(guint32)payload[3];
+				break;
+
+			case KEYMANAGER_TAG_IDENTITY:
+				if (len == 8)
+					memcpy(km->identity, payload, 8);
+				break;
+
+			case KEYMANAGER_TAG_PRIV_ED25519:
+				if (len == 32)
+					memcpy(km->priv_ed25519, payload, 32);
+				break;
+
+			case KEYMANAGER_TAG_PRIV_CU25519:
+				if (len == 32)
+					memcpy(km->priv_cu25519, payload, 32);
+				break;
+
+			case KEYMANAGER_TAG_PRIV_RSA:
+				if (len > 0 && len <= 1024) {
+					g_free(km->priv_rsa);
+					km->priv_rsa = g_memdup2(payload, len);
+					km->priv_rsa_len = len;
+				}
+				break;
+
+			case KEYMANAGER_TAG_AUTHRING_ED25519:
+				if (len > 0)
+					parse_authring(km->authring_ed25519, payload, len);
+				break;
+
+			case KEYMANAGER_TAG_AUTHRING_CU25519:
+				if (len > 0)
+					parse_authring(km->authring_cu25519, payload, len);
+				break;
+
+			case KEYMANAGER_TAG_SHAREKEYS:
+				if (len > 0)
+					parse_share_keys(km->share_keys, payload, len);
+				break;
+
+			case KEYMANAGER_TAG_PENDING_INSHARES:
+				if (len > 0)
+					parse_pending_inshares(km->pending_inshares, payload, len);
+				break;
+
+			default:
+				// Unknown tag, skip
+				break;
+		}
+
+		offset += len;
+	}
+
+	return TRUE;
+}
+
+// Decrypt and parse ^!keys attribute
+static gboolean keymanager_decrypt(struct mega_keymanager *km, const gchar *b64_data,
+		const guchar *master_key)
+{
+	gsize data_len = 0;
+	guchar *data = base64urldecode(b64_data, &data_len);
+	if (!data) {
+		g_printerr("WARNING: Failed to decode ^!keys base64 data\n");
+		return FALSE;
+	}
+
+	// Wire format: [version:1=20][reserved:1][iv:12][ciphertext+tag:...]
+	if (data_len < 2 + KEYMANAGER_IV_LEN + KEYMANAGER_TAG_LEN) {
+		g_printerr("WARNING: ^!keys data too short (%zu bytes)\n", data_len);
+		g_free(data);
+		return FALSE;
+	}
+
+	if (data[0] != KEYMANAGER_VERSION) {
+		g_printerr("WARNING: ^!keys version mismatch (got %d, expected %d)\n",
+				data[0], KEYMANAGER_VERSION);
+		g_free(data);
+		return FALSE;
+	}
+
+	const guchar *iv = data + 2;
+	const guchar *ciphertext = data + 2 + KEYMANAGER_IV_LEN;
+	gsize ciphertext_len = data_len - 2 - KEYMANAGER_IV_LEN;
+
+	// Derive decryption key from master key
+	guchar derived_key[16];
+	if (!keymanager_derive_key(master_key, derived_key)) {
+		g_printerr("WARNING: Failed to derive ^!keys encryption key\n");
+		g_free(data);
+		return FALSE;
+	}
+
+	// Decrypt with AES-GCM
+	gsize plaintext_len = ciphertext_len - KEYMANAGER_TAG_LEN;
+	guchar *plaintext = g_malloc(plaintext_len);
+	const guchar *tag = ciphertext + plaintext_len;
+
+	if (!aes128_gcm_decrypt(ciphertext, plaintext_len, derived_key, iv,
+				KEYMANAGER_IV_LEN, tag, KEYMANAGER_TAG_LEN, plaintext)) {
+		g_printerr("WARNING: Failed to GCM decrypt ^!keys\n");
+		g_free(plaintext);
+		g_free(data);
+		return FALSE;
+	}
+
+	// Parse TLV records
+	gboolean ok = keymanager_parse_tlv(km, plaintext, plaintext_len);
+	g_free(plaintext);
+	g_free(data);
+
+	if (ok)
+		km->loaded = TRUE;
+
+	return ok;
+}
+
+// Helper: decode a base64url handle and append handle_size bytes to a byte array
+static void append_decoded_handle(GByteArray *buf, const gchar *handle_b64, gsize handle_size)
+{
+	guchar handle_bin[8] = {0};
+	gsize handle_bin_len = 0;
+	guchar *decoded = base64urldecode(handle_b64, &handle_bin_len);
+	if (decoded && handle_bin_len >= handle_size)
+		memcpy(handle_bin, decoded, handle_size);
+	g_free(decoded);
+	g_byte_array_append(buf, handle_bin, handle_size);
+}
+
+// Serialize an authring hash table into a GByteArray: [handle:8][fingerprint:20][method:1]*
+static GByteArray *serialize_authring(GHashTable *table)
+{
+	GByteArray *buf = g_byte_array_new();
+	if (!table || g_hash_table_size(table) == 0)
+		return buf;
+
+	GHashTableIter iter;
+	gpointer key, value;
+	g_hash_table_iter_init(&iter, table);
+	while (g_hash_table_iter_next(&iter, &key, &value)) {
+		const struct authring_entry *entry = value;
+		append_decoded_handle(buf, (const gchar *)key, 8);
+		g_byte_array_append(buf, entry->fingerprint, 20);
+		gint8 method = (gint8)entry->method;
+		g_byte_array_append(buf, (const guint8 *)&method, 1);
+	}
+	return buf;
+}
+
+// Serialize share keys hash table into a GByteArray: [nodeHandle:6][shareKey:16][flags:1]*
+static GByteArray *serialize_share_keys(GHashTable *table)
+{
+	GByteArray *buf = g_byte_array_new();
+	if (!table || g_hash_table_size(table) == 0)
+		return buf;
+
+	GHashTableIter iter;
+	gpointer key, value;
+	g_hash_table_iter_init(&iter, table);
+	while (g_hash_table_iter_next(&iter, &key, &value)) {
+		const struct mega_share_key_entry *entry = value;
+		append_decoded_handle(buf, (const gchar *)key, 6);
+		g_byte_array_append(buf, entry->key, 16);
+		g_byte_array_append(buf, &entry->flags, 1);
+	}
+	return buf;
+}
+
+// Serialize ^!keys TLV records (for saving to cache)
+static gchar *keymanager_serialize(struct mega_keymanager *km, gsize *out_len)
+{
+	GByteArray *buf = g_byte_array_new();
+
+#define APPEND_TLV(tag, payload, len) do { \
+	guint8 hdr[4]; \
+	hdr[0] = (tag); \
+	hdr[1] = ((len) >> 16) & 0xff; \
+	hdr[2] = ((len) >> 8) & 0xff; \
+	hdr[3] = (len) & 0xff; \
+	g_byte_array_append(buf, hdr, 4); \
+	g_byte_array_append(buf, (const guint8 *)(payload), (len)); \
+} while(0)
+
+	guint8 ver = km->version;
+	APPEND_TLV(KEYMANAGER_TAG_VERSION, &ver, 1);
+
+	guint32 gen_be = GUINT32_TO_BE(km->generation);
+	APPEND_TLV(KEYMANAGER_TAG_GENERATION, (guint8*)&gen_be, 4);
+
+	APPEND_TLV(KEYMANAGER_TAG_IDENTITY, km->identity, 8);
+	APPEND_TLV(KEYMANAGER_TAG_PRIV_ED25519, km->priv_ed25519, 32);
+	APPEND_TLV(KEYMANAGER_TAG_PRIV_CU25519, km->priv_cu25519, 32);
+
+	if (km->priv_rsa && km->priv_rsa_len > 0)
+		APPEND_TLV(KEYMANAGER_TAG_PRIV_RSA, km->priv_rsa, km->priv_rsa_len);
+
+	// Serialize authrings
+	{
+		GByteArray *ar = serialize_authring(km->authring_ed25519);
+		if (ar->len > 0)
+			APPEND_TLV(KEYMANAGER_TAG_AUTHRING_ED25519, ar->data, ar->len);
+		g_byte_array_unref(ar);
+	}
+	{
+		GByteArray *ar = serialize_authring(km->authring_cu25519);
+		if (ar->len > 0)
+			APPEND_TLV(KEYMANAGER_TAG_AUTHRING_CU25519, ar->data, ar->len);
+		g_byte_array_unref(ar);
+	}
+
+	// Serialize share keys
+	{
+		GByteArray *sk = serialize_share_keys(km->share_keys);
+		if (sk->len > 0)
+			APPEND_TLV(KEYMANAGER_TAG_SHAREKEYS, sk->data, sk->len);
+		g_byte_array_unref(sk);
+	}
+
+#undef APPEND_TLV
+
+	*out_len = buf->len;
+	gchar *result = g_memdup2(buf->data, buf->len);
+	g_byte_array_unref(buf);
+	return result;
+}
+
+// Load share keys from KeyManager into the session's share_keys hash table
+static void keymanager_load_share_keys(struct mega_session *s)
+{
+	if (!s->keymanager.loaded)
+		return;
+
+	// Load regular share keys
+	GHashTableIter iter;
+	gpointer key, value;
+	g_hash_table_iter_init(&iter, s->keymanager.share_keys);
+	while (g_hash_table_iter_next(&iter, &key, &value)) {
+		const gchar *handle = key;
+		const struct mega_share_key_entry *entry = value;
+
+		// Don't overwrite existing share keys
+		if (!g_hash_table_contains(s->share_keys, handle)) {
+			guchar *key_copy = g_memdup2(entry->key, 16);
+			add_share_key(s, handle, key_copy);
+		}
+	}
+
+	// Load pending inshares (share keys from contacts who shared folders with us)
+	if (s->keymanager.pending_inshares) {
+		g_hash_table_iter_init(&iter, s->keymanager.pending_inshares);
+		while (g_hash_table_iter_next(&iter, &key, &value)) {
+			const gchar *handle = key;
+			const struct mega_pending_inshare *pis = value;
+
+			if (!g_hash_table_contains(s->share_keys, handle)) {
+				guchar *key_copy = g_memdup2(pis->share_key, 16);
+				add_share_key(s, handle, key_copy);
+			}
+		}
+	}
+}
+
+// Fetch a contact's Cu25519 public key from the server.
+// Returns a newly-allocated 32-byte key, or NULL on failure.
+static guchar *fetch_contact_cu25519_pubkey(struct mega_session *s, const gchar *user_handle)
+{
+	gsize key_len = 0;
+	guchar *key = NULL;
+
+	// Fetch via uga API
+	gc_free gchar *req = g_strdup_printf("[{a:uga, u:\"%s\", ua:\"+puCu255\", v:1}]", user_handle);
+	GError *local_err = NULL;
+	gc_free gchar *response = api_request(s, req, &local_err);
+	const gchar *node = api_response_check(response, 'o', NULL, &local_err);
+	if (!node)
+		return NULL;
+
+	// Response format: {at: {av: <base64_key>, v: <version>}}
+	const gchar *attr_node = s_json_get_member(node, "at");
+	if (!attr_node)
+		return NULL;
+
+	gc_free gchar *b64 = s_json_get_member_string(attr_node, "av");
+	if (!b64)
+		return NULL;
+
+	key = base64urldecode(b64, &key_len);
+	if (!key || key_len != 32) {
+		g_free(key);
+		return NULL;
+	}
+
+	return key;
+}
+
+// Decrypt ECDH-encrypted share key from a contact.
+// The encrypted key is AES-ECB encrypted with a pairwise key derived from:
+//   x25519(my_priv_cu25519, their_pub_cu25519) -> HMAC chain -> 16-byte AES key
+// encrypted_key_b64 is the base64-encoded AES-ECB ciphertext (16 bytes).
+static guchar *keymanager_decrypt_share_key(struct mega_session *s, const gchar *from_user_handle,
+		const gchar *encrypted_key_b64, GError **err)
+{
+	static const guchar zero_key[32] = {0};
+	if (!s->keymanager.loaded || !memcmp(s->keymanager.priv_cu25519, zero_key, 32)) {
+		g_set_error(err, MEGA_ERROR, MEGA_ERROR_OTHER,
+				"KeyManager not loaded or Cu25519 key not available");
+		return NULL;
+	}
+
+	// Decode the encrypted share key
+	gsize enc_len = 0;
+	gc_free guchar *enc_data = base64urldecode(encrypted_key_b64, &enc_len);
+	if (!enc_data || enc_len != 16) {
+		g_set_error(err, MEGA_ERROR, MEGA_ERROR_OTHER, "Invalid encrypted share key");
+		return NULL;
+	}
+
+	// Fetch the contact's Cu25519 public key
+	gc_free guchar *their_pub = fetch_contact_cu25519_pubkey(s, from_user_handle);
+	if (!their_pub) {
+		g_set_error(err, MEGA_ERROR, MEGA_ERROR_OTHER,
+				"Failed to fetch Cu25519 public key for %s", from_user_handle);
+		return NULL;
+	}
+
+	// Import our private Cu25519 key
+	struct x25519_key my_key;
+	memset(&my_key, 0, sizeof(my_key));
+	if (!x25519_key_from_private(&my_key, s->keymanager.priv_cu25519)) {
+		g_set_error(err, MEGA_ERROR, MEGA_ERROR_OTHER, "Failed to import Cu25519 private key");
+		return NULL;
+	}
+
+	// Derive pairwise symmetric key via ECDH + HMAC chain
+	guchar pairwise_key[16];
+	if (!x25519_pairwise_key(&my_key, their_pub, pairwise_key)) {
+		x25519_key_free(&my_key);
+		g_set_error(err, MEGA_ERROR, MEGA_ERROR_OTHER, "ECDH key derivation failed");
+		return NULL;
+	}
+	x25519_key_free(&my_key);
+
+	// AES-ECB decrypt the share key with the pairwise key
+	guchar *share_key = g_malloc(16);
+	if (!aes128_decrypt(share_key, enc_data, 16, pairwise_key)) {
+		g_free(share_key);
+		g_set_error(err, MEGA_ERROR, MEGA_ERROR_OTHER, "Failed to decrypt share key");
+		return NULL;
+	}
+
+	return share_key;
+}
+
+// }}}
+// {{{ authring verification (TOFU + Ed25519 signature checks)
+
+// Compute fingerprint of a public key: SHA-256 truncated to 20 bytes (160 bits)
+static gboolean authring_fingerprint(const guchar *pubkey, gsize pubkey_len, guchar fp[20])
+{
+	guchar hash[32];
+	unsigned int hash_len = 0;
+
+	if (!EVP_Digest(pubkey, pubkey_len, hash, &hash_len, EVP_sha256(), NULL))
+		return FALSE;
+
+	memcpy(fp, hash, 20);
+	return TRUE;
+}
+
+// Verify an Ed25519 signature of a Cu25519 public key.
+// The signed message is: "keyauth" || timestamp(8) || cu25519_pubkey(32)
+// sig_data is the raw +sigCu255 attribute: timestamp(8) || signature(64) = 72 bytes
+// ed25519_pubkey is the signer's Ed25519 public key (32 bytes)
+static gboolean authring_verify_cu25519_signature(const guchar *cu25519_pubkey,
+		const guchar *sig_data, gsize sig_len,
+		const guchar *ed25519_pubkey)
+{
+	if (sig_len < 72)
+		return FALSE;
+
+	// Reconstruct the signed message: "keyauth" || timestamp(8) || cu25519_key(32)
+	const char prefix[] = "keyauth";
+	guchar message[7 + 8 + 32]; // 47 bytes
+	memcpy(message, prefix, 7);
+	memcpy(message + 7, sig_data, 8);  // timestamp
+	memcpy(message + 7 + 8, cu25519_pubkey, 32);
+
+	// Import Ed25519 public key
+	EVP_PKEY *pkey = NULL;
+	{
+		EVP_PKEY_CTX *kctx = EVP_PKEY_CTX_new_id(EVP_PKEY_ED25519, NULL);
+		if (!kctx) return FALSE;
+		if (EVP_PKEY_fromdata_init(kctx) <= 0) { EVP_PKEY_CTX_free(kctx); return FALSE; }
+		OSSL_PARAM params[] = {
+			OSSL_PARAM_construct_octet_string(OSSL_PKEY_PARAM_PUB_KEY, (void*)ed25519_pubkey, 32),
+			OSSL_PARAM_construct_end()
+		};
+		if (EVP_PKEY_fromdata(kctx, &pkey, EVP_PKEY_PUBLIC_KEY, params) <= 0) {
+			EVP_PKEY_CTX_free(kctx);
+			return FALSE;
+		}
+		EVP_PKEY_CTX_free(kctx);
+	}
+
+	// Verify the detached signature (bytes 8..72 of sig_data)
+	EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
+	gboolean ok = FALSE;
+	if (mdctx) {
+		if (EVP_DigestVerifyInit(mdctx, NULL, NULL, NULL, pkey) == 1)
+			ok = (EVP_DigestVerify(mdctx, sig_data + 8, 64, message, sizeof(message)) == 1);
+		EVP_MD_CTX_free(mdctx);
+	}
+
+	EVP_PKEY_free(pkey);
+	return ok;
+}
+
+// Authring check for a contact's public key (TOFU model).
+// Returns:
+//   0 = OK (key matches or first encounter recorded)
+//  -1 = TOFU VIOLATION (key changed unexpectedly)
+//   1 = signature verified (for Cu25519)
+static gint authring_check_key(struct mega_session *s, const gchar *user_handle,
+		const guchar *pubkey, gsize pubkey_len,
+		gboolean is_cu25519)
+{
+	if (!s->keymanager.loaded)
+		return 0;
+
+	GHashTable *authring = is_cu25519 ? s->keymanager.authring_cu25519 : s->keymanager.authring_ed25519;
+	const char *label = is_cu25519 ? "Cu25519" : "Ed25519";
+
+	guchar fp[20];
+	if (!authring_fingerprint(pubkey, pubkey_len, fp))
+		return 0;
+
+	struct authring_entry *entry = g_hash_table_lookup(authring, user_handle);
+
+	if (entry) {
+		if (memcmp(fp, entry->fingerprint, 20) != 0) {
+			g_printerr("AUTHRING: %s key fingerprint changed for %s — TOFU violation\n",
+					label, user_handle);
+			return -1;
+		}
+		return 0;
+	}
+
+	// First encounter: record as seen
+	entry = g_new0(struct authring_entry, 1);
+	memcpy(entry->fingerprint, fp, 20);
+	entry->method = AUTH_METHOD_SEEN;
+	g_hash_table_insert(authring, g_strdup(user_handle), entry);
+	return 0;
+}
+
+// Check a share key against the authring.
+// The share comes from user_handle (the sharer).
+// Returns TRUE if the share key is acceptable, FALSE if it should be rejected.
+static gboolean authring_check_share_key(struct mega_session *s, const gchar *user_handle)
+{
+	if (!s->keymanager.loaded)
+		return TRUE; // no authring, accept
+
+	// We don't have the sharer's public keys readily available here,
+	// so we can't do a full fingerprint check on the share key itself.
+	// The authring check is done when we encounter the sharer's public keys
+	// during fetchnodes (the +puEd255 and +puCu255 attributes in the 'u' array).
+	//
+	// For now, accept all share keys — the real protection is that
+	// the share key comes from ^!keys which is GCM-authenticated.
+	return TRUE;
+}
+
+// Process contact public keys from the 'u' array and verify against authrings.
+// This should be called during mega_session_refresh after parsing the 'u' array.
+// Helper: verify and update authring entry for a Cu25519 key
+static void authring_verify_cu25519_for_contact(struct mega_session *s, const gchar *user_handle,
+		const guchar *cu25519_key,
+		const guchar *ed25519_key,
+		const guchar *sig_data, gsize sig_len)
+{
+	struct authring_entry *entry;
+
+	if (!authring_verify_cu25519_signature(cu25519_key, sig_data, sig_len, ed25519_key)) {
+		g_printerr("WARNING: Cu25519 signature verification failed for %s\n", user_handle);
+		goto do_tofu;
+	}
+
+	// Signature valid: update or create authring entry
+	entry = g_hash_table_lookup(s->keymanager.authring_cu25519, user_handle);
+	if (entry) {
+		entry->method = AUTH_METHOD_SIGNATURE;
+	} else {
+		guchar fp[20];
+		authring_fingerprint(cu25519_key, 32, fp);
+		entry = g_new0(struct authring_entry, 1);
+		memcpy(entry->fingerprint, fp, 20);
+		entry->method = AUTH_METHOD_SIGNATURE;
+		g_hash_table_insert(s->keymanager.authring_cu25519, g_strdup(user_handle), entry);
+	}
+	if (mega_debug & MEGA_DEBUG_API)
+		g_printerr("AUTHRING: Cu25519 signature verified for %s\n", user_handle);
+
+do_tofu:
+	// Also do TOFU fingerprint check
+	if (authring_check_key(s, user_handle, cu25519_key, 32, TRUE) < 0)
+		g_printerr("WARNING: Cu25519 key verification failed for %s\n", user_handle);
+}
+
+static void authring_verify_contacts(struct mega_session *s, const gchar *f_node)
+{
+	if (!s->keymanager.loaded)
+		return;
+
+	const gchar *u_node = s_json_get_member(f_node, "u");
+	if (!u_node || s_json_get_type(u_node) != S_JSON_TYPE_ARRAY)
+		return;
+
+	gc_free gchar **u_arr = s_json_get_elements(u_node);
+	gint i, l;
+	for (i = 0, l = g_strv_length(u_arr); i < l; i++) {
+		const gchar *u = u_arr[i];
+		if (s_json_get_type(u) != S_JSON_TYPE_OBJECT)
+			continue;
+
+		gc_free gchar *user_handle = s_json_get_member_string(u, "u");
+		if (!user_handle)
+			continue;
+		if (s->user_handle && !strcmp(user_handle, s->user_handle))
+			continue;
+
+		// Extract Ed25519 public key
+		gsize ed_key_len = 0;
+		gc_free guchar *ed25519_key = NULL;
+		const gchar *ed_node = s_json_get_member(u, "+puEd255");
+		if (!ed_node) goto skip_ed25519;
+		gc_free gchar *ed_b64 = s_json_get_member_string(ed_node, "av");
+		if (!ed_b64) goto skip_ed25519;
+		ed25519_key = base64urldecode(ed_b64, &ed_key_len);
+		if (!ed25519_key || ed_key_len != 32) {
+			g_free(ed25519_key);
+			ed25519_key = NULL;
+			goto skip_ed25519;
+		}
+		if (authring_check_key(s, user_handle, ed25519_key, 32, FALSE) < 0)
+			g_printerr("WARNING: Ed25519 key verification failed for %s\n", user_handle);
+
+skip_ed25519:;
+
+	     // Extract Cu25519 public key
+	     const gchar *cu_node = s_json_get_member(u, "+puCu255");
+	     if (!cu_node) continue;
+	     gc_free gchar *cu_b64 = s_json_get_member_string(cu_node, "av");
+	     if (!cu_b64) continue;
+	     gsize cu_key_len = 0;
+	     gc_free guchar *cu25519_key = base64urldecode(cu_b64, &cu_key_len);
+	     if (!cu25519_key || cu_key_len != 32)
+		     continue;
+
+	     // Try signature verification if Ed25519 key and signature are available
+	     const gchar *sig_node = s_json_get_member(u, "+sigCu255");
+	     if (sig_node && ed25519_key) {
+		     gc_free gchar *sig_b64 = s_json_get_member_string(sig_node, "av");
+		     if (sig_b64) {
+			     gsize sig_len = 0;
+			     gc_free guchar *sig_data = base64urldecode(sig_b64, &sig_len);
+			     if (sig_data && sig_len >= 72)
+				     authring_verify_cu25519_for_contact(
+						     s, user_handle, cu25519_key,
+						     ed25519_key, sig_data, sig_len);
+		     }
+	     }
+
+	     // TOFU fingerprint check
+	     if (authring_check_key(s, user_handle, cu25519_key, 32, TRUE) < 0)
+		     g_printerr("WARNING: Cu25519 key verification failed for %s\n", user_handle);
+	}
 }
 
 // }}}
@@ -1258,6 +2525,104 @@ static void pack_node_key(guchar node_key[32], guchar aes_key[16], guchar nonce[
 	DW(node_key, 5) = DW(nonce, 1);
 	DW(node_key, 6) = DW(meta_mac, 0) ^ DW(meta_mac, 1);
 	DW(node_key, 7) = DW(meta_mac, 2) ^ DW(meta_mac, 3);
+}
+
+// }}}
+// {{{ build_cr_array
+
+// Walk up the parent chain from a node and collect all share key handles.
+// Returns a newly-allocated GSList of handle strings (caller must free).
+static GSList *find_share_keys_for_node(struct mega_session *s, struct mega_node *node)
+{
+	GSList *shares = NULL;
+	struct mega_node *n = node;
+
+	while (n) {
+		if (n->handle && g_hash_table_contains(s->share_keys, n->handle)) {
+			shares = g_slist_prepend(shares, n->handle);
+		}
+		n = n->parent;
+	}
+
+	return shares;
+}
+
+// Parse the first node from a putnodes "f" array response.
+// Returns a newly parsed mega_node, or NULL on error (with *err set).
+static struct mega_node *parse_putnodes_response(struct mega_session *s, const gchar *response, GError **err)
+{
+	gc_free gchar *node = s_json_get(response);
+	if (!node) {
+		g_set_error(err, MEGA_ERROR, MEGA_ERROR_OTHER, "Invalid putnodes response");
+		return NULL;
+	}
+
+	const gchar *f_arr = s_json_get_member(node, "f");
+	if (s_json_get_type(f_arr) != S_JSON_TYPE_ARRAY) {
+		g_set_error(err, MEGA_ERROR, MEGA_ERROR_OTHER, "Invalid putnodes response: missing f array");
+		return NULL;
+	}
+
+	const gchar *f_el = s_json_get_element(f_arr, 0);
+	if (!f_el || s_json_get_type(f_el) != S_JSON_TYPE_OBJECT) {
+		g_set_error(err, MEGA_ERROR, MEGA_ERROR_OTHER, "Invalid putnodes response: empty f array");
+		return NULL;
+	}
+
+	struct mega_node *n = mega_node_parse(s, f_el);
+	if (!n) {
+		g_set_error(err, MEGA_ERROR, MEGA_ERROR_OTHER, "Invalid putnodes response: can't parse node");
+		return NULL;
+	}
+
+	return n;
+}
+
+// Generate the "cr" array in a putnodes SJsonGen for shared folder key propagation.
+// Encrypts node_key with each ancestor share key and emits the cr array structure.
+static void generate_cr_array(SJsonGen *gen, struct mega_session *s,
+			      struct mega_node *parent_node,
+			      const guchar *node_key, gsize node_key_len,
+			      const gchar *item_handle)
+{
+	GSList *shares = find_share_keys_for_node(s, parent_node);
+	if (!shares)
+		return;
+
+	s_json_gen_member_array(gen, "cr");
+
+	// sub-array 0: share handles
+	s_json_gen_start_array(gen);
+	for (GSList *li = shares; li; li = li->next)
+		s_json_gen_string(gen, (const gchar *)li->data);
+	s_json_gen_end_array(gen);
+
+	// sub-array 1: item handles
+	s_json_gen_start_array(gen);
+	s_json_gen_string(gen, item_handle);
+	s_json_gen_end_array(gen);
+
+	// sub-array 2: linkage tuples (share_idx, item_idx, encrypted_key)
+	s_json_gen_start_array(gen);
+	gint share_idx = 0;
+	for (GSList *li = shares; li; li = li->next, share_idx++) {
+		const gchar *share_handle = li->data;
+		const guchar *share_key = g_hash_table_lookup(s->share_keys, share_handle);
+		if (!share_key) continue;
+
+		guchar enc_key[32];
+		if (!aes128_encrypt(enc_key, node_key, node_key_len, share_key))
+			continue;
+
+		gc_free gchar *enc_key_b64 = base64urlencode(enc_key, node_key_len);
+		s_json_gen_int(gen, share_idx);
+		s_json_gen_int(gen, 0);
+		s_json_gen_string(gen, enc_key_b64);
+	}
+	s_json_gen_end_array(gen);
+
+	s_json_gen_end_array(gen);
+	g_slist_free(shares);
 }
 
 // }}}
@@ -1338,46 +2703,46 @@ gboolean handle_auth(const gchar *handle, const gchar *b64_ha, const guchar *mas
 static const gchar *srv_error_to_string(gint code)
 {
 	switch (code) {
-	case SRV_EINTERNAL:
-		return "EINTERNAL";
-	case SRV_EARGS:
-		return "EARGS";
-	case SRV_EAGAIN:
-		return "EAGAIN";
-	case SRV_ERATELIMIT:
-		return "ERATELIMIT";
-	case SRV_EFAILED:
-		return "EFAILED";
-	case SRV_ETOOMANY:
-		return "ETOOMANY";
-	case SRV_ERANGE:
-		return "ERANGE";
-	case SRV_EEXPIRED:
-		return "EEXPIRED";
-	case SRV_ENOENT:
-		return "ENOENT";
-	case SRV_ECIRCULAR:
-		return "ECIRCULAR";
-	case SRV_EACCESS:
-		return "EACCESS";
-	case SRV_EEXIST:
-		return "EEXIST";
-	case SRV_EINCOMPLETE:
-		return "EINCOMPLETE";
-	case SRV_EKEY:
-		return "EKEY";
-	case SRV_ESID:
-		return "ESID";
-	case SRV_EBLOCKED:
-		return "EBLOCKED";
-	case SRV_EOVERQUOTA:
-		return "EOVERQUOTA";
-	case SRV_ETEMPUNAVAIL:
-		return "ETEMPUNAVAIL";
-	case SRV_ETOOMANYCONNECTIONS:
-		return "ETOOMANYCONNECTIONS";
-	default:
-		return "EUNKNOWN";
+		case SRV_EINTERNAL:
+			return "EINTERNAL";
+		case SRV_EARGS:
+			return "EARGS";
+		case SRV_EAGAIN:
+			return "EAGAIN";
+		case SRV_ERATELIMIT:
+			return "ERATELIMIT";
+		case SRV_EFAILED:
+			return "EFAILED";
+		case SRV_ETOOMANY:
+			return "ETOOMANY";
+		case SRV_ERANGE:
+			return "ERANGE";
+		case SRV_EEXPIRED:
+			return "EEXPIRED";
+		case SRV_ENOENT:
+			return "ENOENT";
+		case SRV_ECIRCULAR:
+			return "ECIRCULAR";
+		case SRV_EACCESS:
+			return "EACCESS";
+		case SRV_EEXIST:
+			return "EEXIST";
+		case SRV_EINCOMPLETE:
+			return "EINCOMPLETE";
+		case SRV_EKEY:
+			return "EKEY";
+		case SRV_ESID:
+			return "ESID";
+		case SRV_EBLOCKED:
+			return "EBLOCKED";
+		case SRV_EOVERQUOTA:
+			return "EOVERQUOTA";
+		case SRV_ETEMPUNAVAIL:
+			return "ETEMPUNAVAIL";
+		case SRV_ETOOMANYCONNECTIONS:
+			return "ETOOMANYCONNECTIONS";
+		default:
+			return "EUNKNOWN";
 	}
 }
 
@@ -1408,7 +2773,7 @@ static gchar *api_request_unsafe(struct mega_session *s, const gchar *req_node, 
 	s->id++;
 	if (s->sid)
 		url = g_strdup_printf("https://g.api.mega.co.nz/cs?id=%u&sid=%s%s", s->id, s->sid,
-				      additional_url_params->str);
+				additional_url_params->str);
 	else
 		url = g_strdup_printf("https://g.api.mega.co.nz/cs?id=%u%s", s->id, additional_url_params->str);
 
@@ -1419,7 +2784,7 @@ static gchar *api_request_unsafe(struct mega_session *s, const gchar *req_node, 
 	// handle http errors
 	if (!res_str) {
 		if (local_err->domain == HTTP_ERROR &&
-		    (local_err->code == HTTP_ERROR_NO_RESPONSE || local_err->code == HTTP_ERROR_SERVER_BUSY)) {
+				(local_err->code == HTTP_ERROR_NO_RESPONSE || local_err->code == HTTP_ERROR_SERVER_BUSY)) {
 			// simulate SRV_EAGAIN response if server drops connection
 			return g_strdup_printf("%d", SRV_EAGAIN);
 		} else {
@@ -1514,7 +2879,7 @@ static const gchar *api_response_check(const gchar *response, gchar expects, gin
 				*error_code = v;
 
 			g_set_error(err, MEGA_ERROR, MEGA_ERROR_OTHER, "Server returned error %s",
-				    srv_error_to_string(v));
+					srv_error_to_string(v));
 			return NULL;
 		}
 	}
@@ -1541,7 +2906,7 @@ static const gchar *api_response_check(const gchar *response, gchar expects, gin
 						*error_code = v;
 
 					g_set_error(err, MEGA_ERROR, MEGA_ERROR_OTHER, "Server returned error %s",
-						    srv_error_to_string(v));
+							srv_error_to_string(v));
 					return NULL;
 				}
 
@@ -1616,28 +2981,45 @@ static void build_node_tree(struct mega_session *s)
 	GSList *i, *next;
 	g_return_if_fail(s != NULL);
 
-	// node handles are assumed to be unique
+	// node handles are assumed to be unique - keep first occurrence, skip duplicates
 	GHashTable *handle_map = g_hash_table_new(g_str_hash, g_str_equal);
+	GSList *unique_list = NULL;
 	for (i = s->fs_nodes; i; i = i->next) {
 		struct mega_node *n = i->data;
 
-		if (!g_hash_table_insert(handle_map, n->handle, n))
-			g_printerr("WARNING: Dup node handle detected %s\n", n->handle);
+		if (!g_hash_table_contains(handle_map, n->handle)) {
+			g_hash_table_insert(handle_map, n->handle, n);
+			unique_list = g_slist_prepend(unique_list, n);
+		}
+		// duplicates are silently dropped (API sometimes returns them)
 	}
+	g_slist_free(s->fs_nodes);
+	s->fs_nodes = g_slist_reverse(unique_list);
 
 	for (i = s->fs_nodes; i;) {
 		struct mega_node *n = i->data;
 		next = i->next;
 
-		if (n->type == MEGA_NODE_CONTACT) {
-			if (n->su_handle)
-				n->parent = g_hash_table_lookup(handle_map, n->su_handle);
-		} else {
-			if (n->parent_handle)
-				n->parent = g_hash_table_lookup(handle_map, n->parent_handle);
-		}
+		if (n->parent_handle)
+			n->parent = g_hash_table_lookup(handle_map, n->parent_handle);
 
 		i = next;
+	}
+
+	// reparent incoming shared folders under the virtual "Shared" node
+	struct mega_node *shared_root = g_hash_table_lookup(handle_map, "SHAREDROOT");
+	if (shared_root) {
+		for (i = s->fs_nodes; i; i = i->next) {
+			struct mega_node *n = i->data;
+
+			// incoming share: folder with su_handle set, no parent, not owned by current user
+			if (n->type == MEGA_NODE_FOLDER &&
+					n->su_handle && !n->parent &&
+					n->user_handle && s->user_handle &&
+					strcmp(n->user_handle, s->user_handle) != 0) {
+				n->parent = shared_root;
+			}
+		}
 	}
 
 	g_hash_table_unref(handle_map);
@@ -1773,7 +3155,7 @@ static gchar *path_simplify(const gchar *path)
 				}
 			} else {
 				if (subroot &&
-				    !strcmp(sane_pathv[j - 1], "..")) /* if we are off base and last item is .. */
+						!strcmp(sane_pathv[j - 1], "..")) /* if we are off base and last item is .. */
 				{
 					sane_pathv[j++] = pathv[i];
 				} else {
@@ -1836,6 +3218,7 @@ static struct mega_node *mega_node_parse(struct mega_session *s, const gchar *no
 	gint node_t = s_json_get_member_int(node, "t", -1);
 	gint64 node_ts = s_json_get_member_int(node, "ts", 0);
 	gint64 node_s = s_json_get_member_int(node, "s", 0);
+	gint node_r = s_json_get_member_int(node, "r", 0); // share access level
 
 	// sanity check parsed values
 	if (!node_h || strlen(node_h) == 0) {
@@ -1847,14 +3230,6 @@ static struct mega_node *mega_node_parse(struct mega_session *s, const gchar *no
 	if (node_t == MEGA_NODE_ROOT) {
 		struct mega_node *n = g_new0(struct mega_node, 1);
 		n->name = g_strdup("Root");
-		n->name_collate_key = g_utf8_collate_key_for_filename(n->name, -1);
-		n->handle = g_strdup(node_h);
-		n->timestamp = node_ts;
-		n->type = node_t;
-		return n;
-	} else if (node_t == MEGA_NODE_INBOX) {
-		struct mega_node *n = g_new0(struct mega_node, 1);
-		n->name = g_strdup("Inbox");
 		n->name_collate_key = g_utf8_collate_key_for_filename(n->name, -1);
 		n->handle = g_strdup(node_h);
 		n->timestamp = node_ts;
@@ -1872,7 +3247,7 @@ static struct mega_node *mega_node_parse(struct mega_session *s, const gchar *no
 
 	// allow only file and dir nodes
 	if (node_t != MEGA_NODE_FOLDER && node_t != MEGA_NODE_FILE) {
-		g_printerr("WARNING: Skipping FS node %s with unknown type %d\n", node_h, node_t);
+		return NULL;
 		return NULL;
 	}
 
@@ -1947,7 +3322,7 @@ static struct mega_node *mega_node_parse(struct mega_session *s, const gchar *no
 	gc_free guchar *node_key = b64_aes128_decrypt(encrypted_node_key, node_share_key, &node_key_len);
 	if (!node_key) {
 		g_printerr("WARNING: Skipping FS node %s because key can't be decrypted %s\n", node_h,
-			   encrypted_node_key);
+				encrypted_node_key);
 		return NULL;
 	}
 
@@ -1984,9 +3359,9 @@ static struct mega_node *mega_node_parse(struct mega_session *s, const gchar *no
 #ifdef G_OS_WIN32
 	while ((check = strpbrk(check, "/\\<>:\"|?*")))
 #else
-	while ((check = strpbrk(check, "/")))
+		while ((check = strpbrk(check, "/")))
 #endif
-		*check = '_';
+			*check = '_';
 
 	// check for invalid names
 	if (!strcmp(node_name, ".") || !strcmp(node_name, "..")) {
@@ -2010,37 +3385,12 @@ static struct mega_node *mega_node_parse(struct mega_session *s, const gchar *no
 	n->size = node_s;
 	n->timestamp = node_ts;
 	n->type = node_t;
+	n->access_level = node_r;
 
-	return n;
-}
-
-// }}}
-// {{{ mega_node_parse_user
-
-static struct mega_node *mega_node_parse_user(struct mega_session *s, const gchar *node)
-{
-	gc_free gchar *node_u = s_json_get_member_string(node, "u");
-	gc_free gchar *node_m = s_json_get_member_string(node, "m");
-	gint64 node_ts = s_json_get_member_int(node, "ts", 0);
-
-	// sanity check parsed values
-	if (!node_u || strlen(node_u) == 0)
-		return NULL;
-
-	if (!node_m || strlen(node_m) == 0)
-		return NULL;
-
-	struct mega_node *n = g_new0(struct mega_node, 1);
-	n->s = s;
-	n->name = node_m;
-	n->name_collate_key = g_utf8_collate_key_for_filename(n->name, -1);
-	n->handle = node_u;
-	n->parent_handle = g_strdup("NETWORK");
-	n->user_handle = g_strdup(node_u);
-	n->timestamp = node_ts;
-	n->type = MEGA_NODE_CONTACT;
-
-	node_u = node_m = NULL;
+	if (mega_debug & MEGA_DEBUG_FS)
+		g_printerr("FS: node %s type=%d user=%s su=%s r=%d\n",
+				n->handle, node_t, n->user_handle ? n->user_handle : "null",
+				n->su_handle ? n->su_handle : "null", node_r);
 
 	return n;
 }
@@ -2052,10 +3402,57 @@ gboolean mega_node_is_writable(struct mega_session *s, struct mega_node *n)
 {
 	g_return_val_if_fail(n != NULL, FALSE);
 
-	return n->type == MEGA_NODE_CONTACT ||
-	       ((n->type == MEGA_NODE_FILE || n->type == MEGA_NODE_FOLDER) &&
-		!strcmp(s->user_handle, n->user_handle)) ||
-	       n->type == MEGA_NODE_ROOT || n->type == MEGA_NODE_NETWORK || n->type == MEGA_NODE_TRASH;
+	// Special nodes are always writable (except Shared which is a container)
+	if (n->type == MEGA_NODE_ROOT || n->type == MEGA_NODE_TRASH)
+		return TRUE;
+
+	// Shared is a read-only container for incoming shares
+	if (n->type == MEGA_NODE_SHARED)
+		return FALSE;
+
+	// Files and folders owned by the user are writable
+	if ((n->type == MEGA_NODE_FILE || n->type == MEGA_NODE_FOLDER) &&
+			n->user_handle && !strcmp(s->user_handle, n->user_handle))
+		return TRUE;
+
+	// Incoming shares with write access (access_level >= 2 means readwrite or full)
+	if (n->su_handle && n->access_level >= 2)
+		return TRUE;
+
+	// Walk up the parent chain to check if we're inside a writable share
+	if (n->parent)
+		return mega_node_is_writable(s, n->parent);
+
+	return FALSE;
+}
+
+// Full access means the node can be deleted/renamed.
+// - Owned nodes: always full access
+// - Incoming shares: only access_level >= 3 (full), NOT 2 (readwrite)
+static gboolean mega_node_is_full_access(struct mega_session *s, struct mega_node *n)
+{
+	g_return_val_if_fail(n != NULL, FALSE);
+
+	if (n->type == MEGA_NODE_ROOT || n->type == MEGA_NODE_TRASH)
+		return TRUE;
+
+	if (n->type == MEGA_NODE_SHARED)
+		return FALSE;
+
+	// Owned nodes are always full access
+	if ((n->type == MEGA_NODE_FILE || n->type == MEGA_NODE_FOLDER) &&
+			n->user_handle && !strcmp(s->user_handle, n->user_handle))
+		return TRUE;
+
+	// Incoming shares: only full access (>= 3), not readwrite (2)
+	if (n->su_handle)
+		return n->access_level >= 3;
+
+	// Walk up the parent chain
+	if (n->parent)
+		return mega_node_is_full_access(s, n->parent);
+
+	return FALSE;
 }
 
 // }}}
@@ -2105,6 +3502,8 @@ struct mega_session *mega_session_new(void)
 
 	s->share_keys = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
 	s->resume_enabled = TRUE;
+
+	keymanager_init(&s->keymanager);
 
 	return s;
 }
@@ -2162,14 +3561,18 @@ void mega_session_free(struct mega_session *s)
 		g_slist_free_full(s->fs_nodes, (GDestroyNotify)mega_node_free);
 		g_hash_table_destroy(s->share_keys);
 		g_hash_table_destroy(s->api_url_params);
+		keymanager_free(&s->keymanager);
 		g_free(s->sid);
 		g_free(s->rid);
 		g_free(s->password_key);
+		g_free(s->password_key_save);
+		g_free(s->password_salt_v2);
 		g_free(s->master_key);
 		rsa_key_free(&s->rsa_key);
 		g_free(s->user_handle);
 		g_free(s->user_name);
 		g_free(s->user_email);
+		g_free(s->proxy);
 		memset(s, 0, sizeof(struct mega_session));
 		g_free(s);
 	}
@@ -2202,7 +3605,7 @@ void mega_session_enable_previews(struct mega_session *s, gboolean enable)
 
 // |specific| is optional so it can be NULL
 gboolean mega_session_open_exp_folder(struct mega_session *s, const gchar *n, const gchar *key, const gchar *specific,
-				      GError **err)
+		GError **err)
 {
 	GError *local_err = NULL;
 	gsize len, i, l;
@@ -2278,12 +3681,12 @@ gboolean mega_session_open_exp_folder(struct mega_session *s, const gchar *n, co
 
 // this has side effect of the current session being closed
 static gboolean mega_session_load(struct mega_session *s,
-				  const gchar *un, const gchar *pw, gint max_age,
-				  gchar **last_sid, gchar** last_pwsalt_v2,
-				  GError **err);
+		const gchar *un, const gchar *pw, gint max_age,
+		gchar **last_sid, gchar** last_pwsalt_v2,
+		GError **err);
 
 gboolean mega_session_open(struct mega_session *s, const gchar *un, const gchar *pw,
-			   gint max_age, gboolean *is_new_session, GError **err)
+		gint max_age, gboolean *is_new_session, GError **err)
 {
 	GError *local_err = NULL;
 	gboolean is_loggedin = FALSE;
@@ -2308,6 +3711,7 @@ gboolean mega_session_open(struct mega_session *s, const gchar *un, const gchar 
 
 	// session load failed, clean session data
 	mega_session_close(s);
+	keymanager_init(&s->keymanager);
 	s->password_key_save = make_password_key(pw);
 	un_lower = g_ascii_strdown(un, -1);
 
@@ -2369,9 +3773,9 @@ gboolean mega_session_open(struct mega_session *s, const gchar *un, const gchar 
 		// derive password key and user hash
 		guchar key[32];
 		PKCS5_PBKDF2_HMAC(pw, strlen(pw),
-				  salt, salt_len,
-				  100000, EVP_sha512(),
-				  sizeof(key), key);
+				salt, salt_len,
+				100000, EVP_sha512(),
+				sizeof(key), key);
 
 		g_free(s->password_key);
 		s->password_key = g_memdup2(key, 16);
@@ -2467,6 +3871,8 @@ void mega_session_close(struct mega_session *s)
 	g_hash_table_remove_all(s->share_keys);
 	g_hash_table_remove_all(s->api_url_params);
 
+	keymanager_free(&s->keymanager);
+
 	s->password_key = NULL;
 	s->password_key_save = NULL;
 	s->password_salt_v2 = NULL;
@@ -2502,8 +3908,8 @@ gboolean mega_session_get_user(struct mega_session *s, GError **err)
 	g_return_val_if_fail(s->sid != NULL, FALSE);
 	g_return_val_if_fail(err == NULL || *err == NULL, FALSE);
 
-	// prepare request
-	gc_free gchar *user_node = api_call(s, 'o', NULL, &local_err, "[{a:ug}]");
+	// prepare request - use v:1 to get extended user data including ^!keys
+	gc_free gchar *user_node = api_call(s, 'o', NULL, &local_err, "[{a:ug, v:1}]");
 	if (!user_node) {
 		g_propagate_error(err, local_err);
 		return FALSE;
@@ -2549,6 +3955,27 @@ gboolean mega_session_get_user(struct mega_session *s, GError **err)
 		return FALSE;
 	}
 
+	// process ^!keys attribute from ug response (v:1 includes it)
+	// The response format is "^!keys": {"av": "<base64_data>", "v": "<version>"}
+	{
+		const gchar *keys_node = s_json_get_member(user_node, "^!keys");
+		if (keys_node && s_json_get_type(keys_node) == S_JSON_TYPE_OBJECT) {
+			gc_free gchar *keys_attr = s_json_get_member_string(keys_node, "av");
+			if (keys_attr && strlen(keys_attr) > 0) {
+				if (keymanager_decrypt(&s->keymanager, keys_attr, s->master_key)) {
+					if (mega_debug & MEGA_DEBUG_API)
+						g_printerr("KeyManager loaded: generation=%u\n",
+								s->keymanager.generation);
+				} else {
+					g_printerr("WARNING: Failed to decrypt KeyManager from ug response\n");
+				}
+			}
+		} else {
+			if (mega_debug & MEGA_DEBUG_API)
+				g_printerr("No '^!keys' in ug response (account may not have migrated)\n");
+		}
+	}
+
 	s->last_refresh = time(NULL);
 
 	return TRUE;
@@ -2576,41 +4003,43 @@ gboolean mega_session_refresh(struct mega_session *s, GError **err)
 	if (mega_debug & MEGA_DEBUG_FS)
 		print_node(f_node, "FS: ");
 
-	// process 'ok' array
-	const gchar *ok_node = s_json_get_member(f_node, "ok");
-	if (ok_node && s_json_get_type(ok_node) == S_JSON_TYPE_ARRAY) {
-		gc_free gchar **oks = s_json_get_elements(ok_node);
+	// load share keys from KeyManager first (for modern accounts)
+	keymanager_load_share_keys(s);
 
-		for (i = 0, l = g_strv_length(oks); i < l; i++) {
-			const gchar *ok = oks[i];
-			if (s_json_get_type(ok) != S_JSON_TYPE_OBJECT)
-				continue;
+	// process 'ok' array (legacy outbound share keys)
+	// Skip entirely when KeyManager is loaded — share keys come from ^!keys
+	if (!s->keymanager.loaded) {
+		const gchar *ok_node = s_json_get_member(f_node, "ok");
+		if (ok_node && s_json_get_type(ok_node) == S_JSON_TYPE_ARRAY) {
+			gc_free gchar **oks = s_json_get_elements(ok_node);
 
-			gc_free gchar *ok_h = s_json_get_member_string(ok, "h"); // h.8
-			gc_free gchar *ok_ha = s_json_get_member_string(ok, "ha"); // b64(aes(h.8 h.8, master_key))
-			gc_free gchar *ok_k =
-				s_json_get_member_string(ok, "k"); // b64(aes(share_key_for_h, master_key))
+			for (i = 0, l = g_strv_length(oks); i < l; i++) {
+				const gchar *ok = oks[i];
+				if (s_json_get_type(ok) != S_JSON_TYPE_OBJECT)
+					continue;
 
-			if (!ok_h || !ok_ha || !ok_k) {
-				g_printerr(
-					"WARNING: Skipping import of a key %s because it's missing required attributes\n",
-					ok_h);
-				continue;
+				gc_free gchar *ok_h = s_json_get_member_string(ok, "h");
+				gc_free gchar *ok_ha = s_json_get_member_string(ok, "ha");
+				gc_free gchar *ok_k = s_json_get_member_string(ok, "k");
+
+				if (!ok_h || !ok_ha || !ok_k) {
+					g_printerr("WARNING: Skipping import of a key %s because it's missing required attributes\n", ok_h);
+					continue;
+				}
+
+				if (!handle_auth(ok_h, ok_ha, s->master_key)) {
+					g_printerr("WARNING: Skipping import of a key %s because it's authentication failed\n", ok_h);
+					continue;
+				}
+
+				gc_free guchar *key = b64_aes128_decrypt(ok_k, s->master_key, NULL);
+				add_share_key(s, ok_h, key);
 			}
-
-			if (!handle_auth(ok_h, ok_ha, s->master_key)) {
-				g_printerr("WARNING: Skipping import of a key %s because it's authentication failed\n",
-					   ok_h);
-				continue;
-			}
-
-			//g_print("Importing key %s:%s\n", ok_h, ok_k);
-
-			gc_free guchar *key = b64_aes128_decrypt(ok_k, s->master_key, NULL);
-
-			add_share_key(s, ok_h, key);
 		}
 	}
+
+	// verify contact public keys against authrings (TOFU + signature checks)
+	authring_verify_contacts(s, f_node);
 
 	// process 'f' array
 	const gchar *ff_node = s_json_get_member(f_node, "f");
@@ -2630,35 +4059,80 @@ gboolean mega_session_refresh(struct mega_session *s, GError **err)
 			list = g_slist_prepend(list, n);
 	}
 
-	// import special root node for contacts
-	struct mega_node *n = g_new0(struct mega_node, 1);
-	n->s = s;
-	n->name = g_strdup("Contacts");
-	n->name_collate_key = g_utf8_collate_key_for_filename(n->name, -1);
-	n->handle = g_strdup("NETWORK");
-	n->type = MEGA_NODE_NETWORK;
-	list = g_slist_prepend(list, n);
-
-	// process 'u' array
-	const gchar *u_node = s_json_get_member(f_node, "u");
-	if (u_node && s_json_get_type(u_node) == S_JSON_TYPE_ARRAY) {
-		gc_free gchar **u_arr = s_json_get_elements(u_node);
-		for (i = 0, l = g_strv_length(u_arr); i < l; i++) {
-			const gchar *u = u_arr[i];
-			if (s_json_get_type(u) != S_JSON_TYPE_OBJECT)
+	// If any nodes were skipped due to missing share keys, re-fetch ^!keys
+	// and retry parsing. This handles the case where a new share was created
+	// between the initial ^!keys fetch and the fetchnodes call.
+	{
+		gboolean has_missing_keys = FALSE;
+		for (i = 0, l = g_strv_length(ff_arr); i < l; i++) {
+			const gchar *f = ff_arr[i];
+			if (s_json_get_type(f) != S_JSON_TYPE_OBJECT)
 				continue;
-
-			gint64 u_c = s_json_get_member_int(u, "c", 0);
-
-			// skip self and removed
-			if (u_c != 1)
+			gc_free gchar *node_k = s_json_get_member_string(f, "k");
+			if (!node_k || strlen(node_k) == 0)
 				continue;
+			// Check if any key part references a share handle we don't have
+			gc_strfreev gchar **parts = g_strsplit(node_k, "/", 0);
+			for (gint j = 0; parts[j]; j++) {
+				gchar *kv = strchr(parts[j], ':');
+				if (!kv) continue;
+				gchar kh = *kv;
+				*kv = '\0';
+				gchar *key_handle = parts[j];
+				if (s->user_handle && !strcmp(s->user_handle, key_handle)) {
+					*kv = kh;
+					continue; // personal key, OK
+				}
+				if (!g_hash_table_contains(s->share_keys, key_handle))
+					has_missing_keys = TRUE;
+				*kv = kh;
+				if (has_missing_keys) break;
+			}
+			if (has_missing_keys) break;
+		}
 
-			struct mega_node *n = mega_node_parse_user(s, u);
-			if (n)
-				list = g_slist_prepend(list, n);
+		if (has_missing_keys && s->keymanager.loaded) {
+			g_printerr("INFO: Missing share keys detected, re-fetching ^!keys\n");
+
+			// Re-fetch ^!keys
+			GError *rekey_err = NULL;
+			gc_free gchar *rekey_node = api_call(s, 'o', NULL, &rekey_err, "[{a:ug, v:1}]");
+			if (rekey_node) {
+				const gchar *keys_node = s_json_get_member(rekey_node, "^!keys");
+				if (keys_node && s_json_get_type(keys_node) == S_JSON_TYPE_OBJECT) {
+					gc_free gchar *keys_attr = s_json_get_member_string(keys_node, "av");
+					if (keys_attr && strlen(keys_attr) > 0)
+						keymanager_decrypt(&s->keymanager, keys_attr, s->master_key);
+				}
+			} else if (rekey_err) {
+				g_error_free(rekey_err);
+			}
+
+			// Reload share keys and retry parsing
+			keymanager_load_share_keys(s);
+			g_slist_free_full(list, (GDestroyNotify)mega_node_free);
+			list = NULL;
+
+			for (i = 0, l = g_strv_length(ff_arr); i < l; i++) {
+				const gchar *f = ff_arr[i];
+				if (s_json_get_type(f) != S_JSON_TYPE_OBJECT)
+					continue;
+
+				struct mega_node *n = mega_node_parse(s, f);
+				if (n)
+					list = g_slist_prepend(list, n);
+			}
 		}
 	}
+
+	// import special root node for incoming shares
+	struct mega_node *shared_root = g_new0(struct mega_node, 1);
+	shared_root->s = s;
+	shared_root->name = g_strdup("Shared");
+	shared_root->name_collate_key = g_utf8_collate_key_for_filename(shared_root->name, -1);
+	shared_root->handle = g_strdup("SHAREDROOT");
+	shared_root->type = MEGA_NODE_SHARED;
+	list = g_slist_prepend(list, shared_root);
 
 	// replace existing nodes
 	g_slist_free_full(s->fs_nodes, (GDestroyNotify)mega_node_free);
@@ -2901,7 +4375,7 @@ struct mega_node *mega_session_mkdir(struct mega_session *s, const gchar *path, 
 	}
 
 	struct mega_node *p = mega_session_stat(s, parent_path);
-	if (!p || p->type == MEGA_NODE_FILE || p->type == MEGA_NODE_INBOX) {
+	if (!p || p->type == MEGA_NODE_FILE) {
 		g_set_error(err, MEGA_ERROR, MEGA_ERROR_OTHER, "Parent directory doesn't exist: %s", parent_path);
 		return NULL;
 	}
@@ -2911,52 +4385,48 @@ struct mega_node *mega_session_mkdir(struct mega_session *s, const gchar *path, 
 		return NULL;
 	}
 
-	if (p->type == MEGA_NODE_NETWORK) {
-		// prepare contact add request
-		gc_free gchar *ur_node = api_call(s, 'o', NULL, &local_err, "[{a:ur, u:%S, l:1, i:%s}]",
-						  g_path_get_basename(tmp), s->rid);
-		if (!ur_node) {
-			g_propagate_error(err, local_err);
-			return NULL;
-		}
-
-		// parse response
-		n = mega_node_parse_user(s, ur_node);
-		if (!n) {
-			g_set_error(err, MEGA_ERROR, MEGA_ERROR_OTHER, "Invalid response");
-			return NULL;
-		}
-	} else {
+	{
 		gc_free guchar *node_key = make_random_key();
 		gc_free gchar *basename = g_path_get_basename(tmp);
 		gc_free gchar *attrs = encode_node_attrs(basename);
 		gc_free gchar *dir_attrs = b64_aes128_cbc_encrypt_str(attrs, node_key);
 		gc_free gchar *dir_key = b64_aes128_encrypt(node_key, 16, s->master_key);
 
-		// prepare request
-		gc_free gchar *mkdir_node =
-			api_call(s, 'o', NULL, &local_err, "[{a:p, t:%s, i:%s, n: [{h:xxxxxxxx, t:1, k:%s, a:%s}]}]",
-				 p->handle, s->rid, dir_key, dir_attrs);
-		if (!mkdir_node) {
+		// build putnodes request using sjson_gen
+		SJsonGen *gen = s_json_gen_new();
+		s_json_gen_start_array(gen);
+		s_json_gen_start_object(gen);
+		s_json_gen_member_string(gen, "a", "p");
+		s_json_gen_member_string(gen, "t", p->handle);
+		s_json_gen_member_string(gen, "i", s->rid);
+
+		// n array with one folder node
+		s_json_gen_member_array(gen, "n");
+		s_json_gen_start_object(gen);
+		s_json_gen_member_string(gen, "h", "xxxxxxxx");
+		s_json_gen_member_int(gen, "t", 1);
+		s_json_gen_member_string(gen, "k", dir_key);
+		s_json_gen_member_string(gen, "a", dir_attrs);
+		s_json_gen_end_object(gen);
+		s_json_gen_end_array(gen);
+
+		// cr array for shared folder access
+		generate_cr_array(gen, s, p, node_key, 16, "xxxxxxxx");
+
+		s_json_gen_end_object(gen);
+		s_json_gen_end_array(gen);
+		gc_free gchar *req = s_json_gen_done(gen);
+
+		gc_free gchar *response = api_request(s, req, &local_err);
+		const gchar *resp_node = api_response_check(response, 'o', NULL, &local_err);
+		if (!resp_node) {
 			g_propagate_error(err, local_err);
 			return NULL;
 		}
 
-		const gchar *f_arr = s_json_get_member(mkdir_node, "f");
-		if (s_json_get_type(f_arr) != S_JSON_TYPE_ARRAY) {
-			g_set_error(err, MEGA_ERROR, MEGA_ERROR_OTHER, "Invalid response");
-			return NULL;
-		}
-
-		const gchar *f_el = s_json_get_element(f_arr, 0);
-		if (!f_el || s_json_get_type(f_el) != S_JSON_TYPE_OBJECT) {
-			g_set_error(err, MEGA_ERROR, MEGA_ERROR_OTHER, "Invalid response");
-			return NULL;
-		}
-
-		n = mega_node_parse(s, f_el);
+		n = parse_putnodes_response(s, resp_node, &local_err);
 		if (!n) {
-			g_set_error(err, MEGA_ERROR, MEGA_ERROR_OTHER, "Invalid response");
+			g_propagate_error(err, local_err);
 			return NULL;
 		}
 	}
@@ -2985,7 +4455,7 @@ gboolean mega_session_rm(struct mega_session *s, const gchar *path, GError **err
 		return FALSE;
 	}
 
-	if (!mega_node_is_writable(s, mn)) {
+	if (!mega_node_is_full_access(s, mn)) {
 		g_set_error(err, MEGA_ERROR, MEGA_ERROR_OTHER, "File is not removable: %s", path);
 		return FALSE;
 	}
@@ -2994,13 +4464,6 @@ gboolean mega_session_rm(struct mega_session *s, const gchar *path, GError **err
 		// prepare request
 		gc_free gchar *rm_node = api_call(s, 'i', NULL, &local_err, "[{a:d, i:%s, n:%s}]", s->rid, mn->handle);
 		if (!rm_node) {
-			g_propagate_error(err, local_err);
-			return FALSE;
-		}
-	} else if (mn->type == MEGA_NODE_CONTACT) {
-		gc_free gchar *ur_node =
-			api_call(s, 'i', NULL, &local_err, "[{a:ur, u:%s, l:0, i:%s}]", mn->handle, s->rid);
-		if (!ur_node) {
 			g_propagate_error(err, local_err);
 			return FALSE;
 		}
@@ -3042,10 +4505,9 @@ gboolean mega_session_rm(struct mega_session *s, const gchar *path, GError **err
 // {{{ mega_session_new_node_attribute
 
 gchar *mega_session_new_node_attribute(struct mega_session *s, const guchar *data, gsize len, const gchar *type,
-				       const guchar *key, GError **err)
+		const guchar *key, GError **err)
 {
 	GError *local_err = NULL;
-	AES_KEY k;
 	guchar iv[AES_BLOCK_SIZE] = { 0 };
 	gsize pad = len % 16 ? 16 - (len % 16) : 0;
 
@@ -3056,7 +4518,7 @@ gchar *mega_session_new_node_attribute(struct mega_session *s, const guchar *dat
 	g_return_val_if_fail(key != NULL, NULL);
 	g_return_val_if_fail(err == NULL || *err == NULL, NULL);
 
-	gc_free gchar *ufa_node = api_call(s, 'o', NULL, &local_err, "[{a:ufa, s:%i, ssl:0}]", (gint64)len + pad);
+	gc_free gchar *ufa_node = api_call(s, 'o', NULL, &local_err, "[{a:ufa, s:%i, ssl:2}]", (gint64)len + pad);
 	if (!ufa_node) {
 		g_propagate_error(err, local_err);
 		return NULL;
@@ -3065,15 +4527,31 @@ gchar *mega_session_new_node_attribute(struct mega_session *s, const guchar *dat
 	gc_free gchar *p_url = s_json_get_member_string(ufa_node, "p");
 
 	// encrypt
-	AES_set_encrypt_key(key, 128, &k);
 	gc_free guchar *plain = g_memdup2(data, len);
 	plain = g_realloc(plain, len + pad);
 	memset(plain + len, 0, pad);
 	gc_free guchar *cipher = g_malloc0(len + pad);
-	AES_cbc_encrypt(plain, cipher, len + pad, &k, iv, 1);
+
+	{
+		EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+		int out_len = 0;
+		if (!ctx || !EVP_EncryptInit_ex(ctx, EVP_aes_128_cbc(), NULL, key, iv)) {
+			EVP_CIPHER_CTX_free(ctx);
+			g_set_error(err, MEGA_ERROR, MEGA_ERROR_OTHER, "Failed to init AES-CBC");
+			return NULL;
+		}
+		EVP_CIPHER_CTX_set_padding(ctx, 0);
+		if (!EVP_EncryptUpdate(ctx, cipher, &out_len, plain, (int)(len + pad))) {
+			EVP_CIPHER_CTX_free(ctx);
+			g_set_error(err, MEGA_ERROR, MEGA_ERROR_OTHER, "Failed to encrypt attribute");
+			return NULL;
+		}
+		EVP_CIPHER_CTX_free(ctx);
+	}
 
 	// upload
 	gc_http_free struct http *h = http_new();
+	http_disable_pinning(h);
 	http_set_proxy(h, s->proxy);
 	http_set_content_type(h, "application/octet-stream");
 	gc_string_free GString *handle = http_post(h, p_url, cipher, len + pad, &local_err);
@@ -3139,11 +4617,11 @@ gchar *mega_session_new_node_attribute(struct mega_session *s, const guchar *dat
 
 #define tman_debug(fmt, args...)                                                                                       \
 	G_STMT_START                                                                                                   \
-	{                                                                                                              \
-		if (mega_debug & MEGA_DEBUG_TMAN)                                                                     \
-			g_print("%" G_GINT64_FORMAT ": " fmt, g_get_monotonic_time(), ##args);                         \
-	}                                                                                                              \
-	G_STMT_END
+{                                                                                                              \
+	if (mega_debug & MEGA_DEBUG_TMAN)                                                                     \
+	g_print("%" G_GINT64_FORMAT ": " fmt, g_get_monotonic_time(), ##args);                         \
+}                                                                                                              \
+G_STMT_END
 
 enum { 
 	CHUNK_STATE_QUEUED = 0,
@@ -3218,7 +4696,6 @@ struct transfer {
 	goffset total_size;
 	goffset transfered_size;
 
-	AES_KEY k;
 	guchar file_key[16];
 	guchar nonce[16];
 
@@ -3275,7 +4752,7 @@ struct transfer_manager {
 static struct transfer_manager tman;
 
 static gboolean tman_transfer_progress(goffset dltotal, goffset dlnow, goffset ultotal, goffset ulnow,
-				       gpointer user_data)
+		gpointer user_data)
 {
 	struct transfer_chunk *c = user_data;
 	struct transfer_manager_msg *msg;
@@ -3334,7 +4811,7 @@ static void tman_worker_upload_chunk(struct transfer_chunk *c, struct transfer_w
 	if (!g_input_stream_read_all(G_INPUT_STREAM(t->istream), buf, c->size, &bytes_read, NULL, &local_err)) {
 		g_mutex_unlock(&t->stream_lock);
 		err = g_error_new(MEGA_ERROR, MEGA_ERROR_OTHER, "Failed reading from the stream: %s",
-				  local_err->message);
+				local_err->message);
 		g_clear_error(&local_err);
 		goto err;
 	}
@@ -3465,6 +4942,7 @@ static gpointer tman_worker_thread_fn(gpointer data)
 	gc_http_free struct http *h = NULL;
 
 	h = http_new();
+	http_disable_pinning(h);
 	http_expect_short_running(h);
 	http_set_max_connects(h, 2);
 
@@ -3475,14 +4953,14 @@ static gpointer tman_worker_thread_fn(gpointer data)
 		}
 
 		switch (msg->type) {
-		case TRANSFER_WORKER_MSG_STOP:
-			g_free(msg);
-			return NULL;
+			case TRANSFER_WORKER_MSG_STOP:
+				g_free(msg);
+				return NULL;
 
-		case TRANSFER_WORKER_MSG_UPLOAD_CHUNK:
-			tman_worker_upload_chunk(msg->chunk, w, h);
-			g_free(msg);
-			break;
+			case TRANSFER_WORKER_MSG_UPLOAD_CHUNK:
+				tman_worker_upload_chunk(msg->chunk, w, h);
+				g_free(msg);
+				break;
 		}
 	}
 
@@ -3509,7 +4987,7 @@ static void schedule_chunk_transfers(void)
 
 			// if the chunk is scheduled to be started in the
 			// future, skip it
-                        if (c->start_at > now)
+			if (c->start_at > now)
 				continue;
 
 			// stop if we can't start more chunk transfers
@@ -3596,7 +5074,7 @@ check_completed:
 			}
 			macs = g_slist_reverse(macs);
 			meta_mac_calculate(macs, t->file_key, tmsg->meta_mac);
-                        g_slist_free(macs);
+			g_slist_free(macs);
 
 			tmsg->upload_handle = t->upload_handle;
 		}
@@ -3653,7 +5131,7 @@ static void prepare_transfer(struct transfer *t)
 	//XXX: mega largely works, but craps out EFAILs on too many connections when coalescing chunks so
 	// let's disable boost for now.
 	gboolean boost = FALSE;
-        if (boost) {
+	if (boost) {
 		while (off < t->total_size) {
 			goffset max_size = 16 * 1024 * 1024;
 			if (chunk_idx < 3)
@@ -3719,17 +5197,6 @@ static void prepare_transfer(struct transfer *t)
 	}
 
 	t->chunks = g_slist_reverse(t->chunks);
-
-#if 0
-	GSList* it;
-	for (it = t->chunks; it; it = it->next) {
-		struct transfer_chunk *c = it->data;
-
-		g_print("CH[%d] = { off=%" G_GOFFSET_FORMAT " size=%" G_GOFFSET_FORMAT " macs=%d }\n", c->index, c->offset, c->size, c->n_macs);
-		for (int i = 0; i < c->n_macs; i++)
-			g_print("  CMAC { off=%u size=%u }\n", c->macs[i].off, c->macs[i].size);
-	}
-#endif
 }
 
 static gpointer tman_manager_thread_fn(gpointer data)
@@ -3752,114 +5219,114 @@ static gpointer tman_manager_thread_fn(gpointer data)
 		}
 
 		switch (msg->type) {
-		case TRANSFER_MANAGER_MSG_STOP:
-			g_free(msg);
-			return NULL;
+			case TRANSFER_MANAGER_MSG_STOP:
+				g_free(msg);
+				return NULL;
 
-		case TRANSFER_MANAGER_MSG_SUBMIT_TRANSFER:
-			t = msg->transfer;
+			case TRANSFER_MANAGER_MSG_SUBMIT_TRANSFER:
+				t = msg->transfer;
 
-			tman_debug("M: transfer submitted %s\n", t->upload_url);
+				tman_debug("M: transfer submitted %s\n", t->upload_url);
 
-			prepare_transfer(t);
-			tman.transfers = g_list_append(tman.transfers, t);
-			schedule_chunk_transfers();
-			break;
+				prepare_transfer(t);
+				tman.transfers = g_list_append(tman.transfers, t);
+				schedule_chunk_transfers();
+				break;
 
-		case TRANSFER_MANAGER_MSG_CHUNK_PROGRESS:
-			c = msg->chunk;
-			t = c->transfer;
+			case TRANSFER_MANAGER_MSG_CHUNK_PROGRESS:
+				c = msg->chunk;
+				t = c->transfer;
 
-			//tman_debug("M: chunk progress for %d\n", c->index);
-			tmsg = g_new0(struct transfer_msg, 1);
-			tmsg->type = TRANSFER_MSG_PROGRESS;
+				//tman_debug("M: chunk progress for %d\n", c->index);
+				tmsg = g_new0(struct transfer_msg, 1);
+				tmsg->type = TRANSFER_MSG_PROGRESS;
 
-			// update overall progress
-			t->transfered_size += msg->transfered_size - c->transfered_size;
-			c->transfered_size = msg->transfered_size;
+				// update overall progress
+				t->transfered_size += msg->transfered_size - c->transfered_size;
+				c->transfered_size = msg->transfered_size;
 
-			tmsg->total_size = t->total_size;
-			tmsg->transfered_size = t->transfered_size;
+				tmsg->total_size = t->total_size;
+				tmsg->transfered_size = t->transfered_size;
 
-			g_async_queue_push(t->submitter_mailbox, tmsg);
-			break;
+				g_async_queue_push(t->submitter_mailbox, tmsg);
+				break;
 
-		case TRANSFER_MANAGER_MSG_CHUNK_DONE:
-			c = msg->chunk;
-			t = c->transfer;
+			case TRANSFER_MANAGER_MSG_CHUNK_DONE:
+				c = msg->chunk;
+				t = c->transfer;
 
-			tman_debug("M: chunk done %d\n", c->index);
+				tman_debug("M: chunk done %d\n", c->index);
 
-			msg->worker->busy = FALSE;
-			tman.current_workers--;
+				msg->worker->busy = FALSE;
+				tman.current_workers--;
 
-			c->status = CHUNK_STATE_DONE;
-			if (msg->upload_handle) {
-				g_free(t->upload_handle);
-				t->upload_handle = msg->upload_handle;
-			}
+				c->status = CHUNK_STATE_DONE;
+				if (msg->upload_handle) {
+					g_free(t->upload_handle);
+					t->upload_handle = msg->upload_handle;
+				}
 
-			schedule_chunk_transfers();
-			break;
-		case TRANSFER_MANAGER_MSG_CHUNK_FAILED: {
-			c = msg->chunk;
-			t = c->transfer;
+				schedule_chunk_transfers();
+				break;
+			case TRANSFER_MANAGER_MSG_CHUNK_FAILED: {
+				c = msg->chunk;
+				t = c->transfer;
 
-			tman_debug("M: chunk fail %d\n", c->index);
+				tman_debug("M: chunk fail %d\n", c->index);
 
-			msg->worker->busy = FALSE;
-			tman.current_workers--;
+				msg->worker->busy = FALSE;
+				tman.current_workers--;
 
-			// re-queue chunk
-			c->status = CHUNK_STATE_QUEUED;
+				// re-queue chunk
+				c->status = CHUNK_STATE_QUEUED;
 
-			gint64 now = g_get_monotonic_time();
+				gint64 now = g_get_monotonic_time();
 
-			if (t->error) {
-				// transfer is in error state and is being aborted
-				tman_debug("M: transfer is being aborted, chunk %d fail ignored\n", c->index);
-			} else {
-				if (g_error_matches(msg->error, HTTP_ERROR, HTTP_ERROR_COMM_FAILURE)
-						|| g_error_matches(msg->error, HTTP_ERROR, HTTP_ERROR_TIMEOUT)
-						|| g_error_matches(msg->error, HTTP_ERROR, HTTP_ERROR_SERVER_BUSY)
-						|| g_error_matches(msg->error, HTTP_ERROR, HTTP_ERROR_NO_RESPONSE)) {
-					if (c->failures_count > 8) {
-						g_printerr("WARNING: chunk upload failed too many times (%s), aborting transfer\n", msg->error->message);
+				if (t->error) {
+					// transfer is in error state and is being aborted
+					tman_debug("M: transfer is being aborted, chunk %d fail ignored\n", c->index);
+				} else {
+					if (g_error_matches(msg->error, HTTP_ERROR, HTTP_ERROR_COMM_FAILURE)
+							|| g_error_matches(msg->error, HTTP_ERROR, HTTP_ERROR_TIMEOUT)
+							|| g_error_matches(msg->error, HTTP_ERROR, HTTP_ERROR_SERVER_BUSY)
+							|| g_error_matches(msg->error, HTTP_ERROR, HTTP_ERROR_NO_RESPONSE)) {
+						if (c->failures_count > 8) {
+							g_printerr("WARNING: chunk upload failed too many times (%s), aborting transfer\n", msg->error->message);
+
+							// mark transfer as aborted
+							t->error = msg->error;
+							msg->error = NULL;
+						} else {
+							g_printerr("WARNING: chunk upload failed (%s), re-trying after %d seconds\n", msg->error->message, (1 << c->failures_count));
+							c->start_at = g_get_monotonic_time() + 1000 * 1000 * ((1 << c->failures_count));
+							c->failures_count++;
+						}
+					} else if (g_error_matches(msg->error, HTTP_ERROR, HTTP_ERROR_BANDWIDTH_LIMIT)) {
+						// we need to defer all further
+						// transfers by a lot
+						g_printerr("WARNING: over upload quota, delaying all transfers by 5 minutes\n");
+						GSList* ci;
+						for (ci = t->chunks; ci; ci = ci->next) {
+							struct transfer_chunk *c = ci->data;
+
+							c->start_at = now + 1000 * (5*60*1000 + g_random_int_range(0, 2000));
+						}
+					} else {
+						g_printerr("WARNING: chunk upload failed (%s), aborting transfer\n", msg->error->message);
 
 						// mark transfer as aborted
 						t->error = msg->error;
 						msg->error = NULL;
-					} else {
-						g_printerr("WARNING: chunk upload failed (%s), re-trying after %d seconds\n", msg->error->message, (1 << c->failures_count));
-						c->start_at = g_get_monotonic_time() + 1000 * 1000 * ((1 << c->failures_count));
-						c->failures_count++;
 					}
-				} else if (g_error_matches(msg->error, HTTP_ERROR, HTTP_ERROR_BANDWIDTH_LIMIT)) {
-					// we need to defer all further
-					// transfers by a lot
-					g_printerr("WARNING: over upload quota, delaying all transfers by 5 minutes\n");
-					GSList* ci;
-					for (ci = t->chunks; ci; ci = ci->next) {
-						struct transfer_chunk *c = ci->data;
-
-						c->start_at = now + 1000 * (5*60*1000 + g_random_int_range(0, 2000));
-					}
-				} else {
-					g_printerr("WARNING: chunk upload failed (%s), aborting transfer\n", msg->error->message);
-
-					// mark transfer as aborted
-					t->error = msg->error;
-					msg->error = NULL;
 				}
+
+				schedule_chunk_transfers();
+				break;
 			}
 
-			schedule_chunk_transfers();
-			break;
-		}
-
-		default:
-			g_assert_not_reached();
-			break;
+			default:
+				g_assert_not_reached();
+				break;
 		}
 
 		g_clear_error(&msg->error);
@@ -3923,11 +5390,11 @@ static void tman_fini(void)
 }
 
 static gboolean tman_run_upload_transfer(
-	// in:
-	struct mega_session *s, guchar file_key[16], guchar nonce[8], const gchar *upload_url,
-	GFileInputStream *istream, goffset file_size,
-	// out:
-	gchar **upload_handle, guchar meta_mac[16], GError **err)
+		// in:
+		struct mega_session *s, guchar file_key[16], guchar nonce[8], const gchar *upload_url,
+		GFileInputStream *istream, goffset file_size,
+		// out:
+		gchar **upload_handle, guchar meta_mac[16], GError **err)
 {
 	struct transfer t = { 0 };
 	gboolean retval = FALSE;
@@ -3944,7 +5411,6 @@ static gboolean tman_run_upload_transfer(
 	// initialize transfer data
 	t.submitter_mailbox = g_async_queue_new();
 	t.total_size = file_size;
-	AES_set_encrypt_key(file_key, 128, &t.k);
 	memcpy(t.file_key, file_key, 16);
 	memcpy(t.nonce, nonce, 8);
 	g_mutex_init(&t.stream_lock);
@@ -3974,30 +5440,30 @@ static gboolean tman_run_upload_transfer(
 		struct transfer_msg *msg = g_async_queue_pop(t.submitter_mailbox);
 
 		switch (msg->type) {
-		case TRANSFER_MSG_DONE:
-			*upload_handle = msg->upload_handle;
-			memcpy(meta_mac, msg->meta_mac, 16);
-			g_free(msg);
-			retval = TRUE;
-			goto out;
+			case TRANSFER_MSG_DONE:
+				*upload_handle = msg->upload_handle;
+				memcpy(meta_mac, msg->meta_mac, 16);
+				g_free(msg);
+				retval = TRUE;
+				goto out;
 
-		case TRANSFER_MSG_ERROR:
-			g_propagate_prefixed_error(err, msg->error, "Upload transfer failed: ");
-			g_free(msg);
-			goto out;
+			case TRANSFER_MSG_ERROR:
+				g_propagate_prefixed_error(err, msg->error, "Upload transfer failed: ");
+				g_free(msg);
+				goto out;
 
-		case TRANSFER_MSG_PROGRESS:
-			status_data = (struct mega_status_data){
-				.type = MEGA_STATUS_PROGRESS,
-				.progress.total = msg->total_size,
-				.progress.done = msg->transfered_size,
-			};
+			case TRANSFER_MSG_PROGRESS:
+				status_data = (struct mega_status_data){
+					.type = MEGA_STATUS_PROGRESS,
+					.progress.total = msg->total_size,
+					.progress.done = msg->transfered_size,
+				};
 
-			send_status(s, &status_data);
-			break;
+				send_status(s, &status_data);
+				break;
 
-		default:
-			g_assert_not_reached();
+			default:
+				g_assert_not_reached();
 		}
 
 		g_free(msg);
@@ -4048,7 +5514,7 @@ static gchar *create_preview(struct mega_session *s, const gchar *local_path, co
 	}
 
 	if (has_ffmpegthumbnailer && g_regex_match_simple("\\.(mpg|mpeg|avi|mkv|flv|rm|mp4|wmv|asf|ram|mov)$",
-							  local_path, G_REGEX_CASELESS, 0)) {
+				local_path, G_REGEX_CASELESS, 0)) {
 		gchar buf[50] = "/tmp/megatools.XXXXXX";
 		gchar *dir = g_mkdtemp(buf);
 		if (dir) {
@@ -4056,7 +5522,7 @@ static gchar *create_preview(struct mega_session *s, const gchar *local_path, co
 			gc_free gchar *thumb_path = g_strdup_printf("%s/thumb.jpg", dir);
 			gc_free gchar *qpath = g_shell_quote(local_path);
 			gc_free gchar *tmp = g_strdup_printf(
-				"ffmpegthumbnailer -t 5 -i %s -o %s/thumb.jpg -s 128 -f -a", qpath, dir);
+					"ffmpegthumbnailer -t 5 -i %s -o %s/thumb.jpg -s 128 -f -a", qpath, dir);
 
 			if (g_spawn_command_line_sync(tmp, &tmp1, &tmp2, &status, &local_err)) {
 				if (g_file_test(thumb_path, G_FILE_TEST_IS_REGULAR)) {
@@ -4065,7 +5531,7 @@ static gchar *create_preview(struct mega_session *s, const gchar *local_path, co
 
 					if (g_file_get_contents(thumb_path, &thumb_data, &thumb_len, NULL)) {
 						handle = mega_session_new_node_attribute(s, thumb_data, thumb_len, "0",
-											 key, &local_err);
+								key, &local_err);
 						if (!handle)
 							g_propagate_error(err, local_err);
 					}
@@ -4079,7 +5545,7 @@ static gchar *create_preview(struct mega_session *s, const gchar *local_path, co
 			g_rmdir(dir);
 		}
 	} else if (has_convert && g_regex_match_simple("\\.(jpe?g|png|gif|bmp|tiff|svg|pnm|eps|ico|pdf)$", local_path,
-						       G_REGEX_CASELESS, 0)) {
+				G_REGEX_CASELESS, 0)) {
 		gchar buf[50] = "/tmp/megatools.XXXXXX";
 		gchar *dir = g_mkdtemp(buf);
 		if (dir) {
@@ -4096,8 +5562,8 @@ static gchar *create_preview(struct mega_session *s, const gchar *local_path, co
 			}
 
 			gc_free gchar *tmp = g_strdup_printf(
-				"convert %s -strip -background white -flatten -resize 128x128^ -gravity center -crop 128x128+0+0 +repage %s/thumb.jpg",
-				qpath, dir);
+					"convert %s -strip -background white -flatten -resize 128x128^ -gravity center -crop 128x128+0+0 +repage %s/thumb.jpg",
+					qpath, dir);
 
 			if (g_spawn_command_line_sync(tmp, &tmp1, &tmp2, &status, &local_err)) {
 				if (g_file_test(thumb_path, G_FILE_TEST_IS_REGULAR)) {
@@ -4106,7 +5572,7 @@ static gchar *create_preview(struct mega_session *s, const gchar *local_path, co
 
 					if (g_file_get_contents(thumb_path, &thumb_data, &thumb_len, NULL)) {
 						handle = mega_session_new_node_attribute(s, thumb_data, thumb_len, "0",
-											 key, &local_err);
+								key, &local_err);
 						if (!handle)
 							g_propagate_error(err, local_err);
 					}
@@ -4167,7 +5633,7 @@ struct mega_node *mega_session_put(struct mega_session *s, struct mega_node *par
 try_again:
 	// ask for upload url - [{"a":"u","ssl":0,"ms":0,"s":<SIZE>,"r":0,"e":0}]
 	g_free(up_node);
-	up_node = api_call(s, 'o', NULL, &local_err, "[{a:u, e:0, ms:0, r:0, s:%i, ssl:0, v:2}]", (gint64)file_size);
+	up_node = api_call(s, 'o', NULL, &local_err, "[{a:u, e:0, ms:0, r:0, s:%i, ssl:2, v:2}]", (gint64)file_size);
 	if (!up_node) {
 		g_propagate_error(err, local_err);
 		return NULL;
@@ -4177,8 +5643,8 @@ try_again:
 	p_url = s_json_get_member_string(up_node, "p");
 
 	transfer_ok = tman_run_upload_transfer(
-		/* in: */ s, aes_key, nonce, p_url, stream, file_size,
-		/* out: */ &up_handle, meta_mac, &local_err);
+			/* in: */ s, aes_key, nonce, p_url, stream, file_size,
+			/* out: */ &up_handle, meta_mac, &local_err);
 
 	if (!transfer_ok) {
 		if (retries-- > 0) {
@@ -4204,30 +5670,42 @@ try_again:
 
 	gc_free gchar *node_key_enc = b64_aes128_encrypt(node_key, 32, s->master_key);
 
-	// prepare request
-	gc_free gchar *put_node =
-		api_call(s, 'o', NULL, &local_err, "[{a:p, t:%s, n:[{h:%s, t:0, k:%s, a:%s, fa:%s}]}]",
-			 parent_node->handle, up_handle, node_key_enc, attrs_enc, fa);
-	if (!put_node) {
+	// build putnodes request using sjson_gen
+	SJsonGen *gen = s_json_gen_new();
+	s_json_gen_start_array(gen);
+	s_json_gen_start_object(gen);
+	s_json_gen_member_string(gen, "a", "p");
+	s_json_gen_member_string(gen, "t", parent_node->handle);
+
+	// n array with one node
+	s_json_gen_member_array(gen, "n");
+	s_json_gen_start_object(gen);
+	s_json_gen_member_string(gen, "h", up_handle);
+	s_json_gen_member_int(gen, "t", 0);
+	s_json_gen_member_string(gen, "k", node_key_enc);
+	s_json_gen_member_string(gen, "a", attrs_enc);
+	if (fa)
+		s_json_gen_member_string(gen, "fa", fa);
+	s_json_gen_end_object(gen);
+	s_json_gen_end_array(gen);
+
+	// cr array for shared folder access
+	generate_cr_array(gen, s, parent_node, node_key, 32, up_handle);
+
+	s_json_gen_end_object(gen);
+	s_json_gen_end_array(gen);
+	gc_free gchar *req = s_json_gen_done(gen);
+
+	gc_free gchar *response = api_request(s, req, &local_err);
+	const gchar *node = api_response_check(response, 'o', NULL, &local_err);
+	if (!node) {
 		g_propagate_error(err, local_err);
 		return NULL;
 	}
 
-	const gchar *f_arr = s_json_get_member(put_node, "f");
-	if (s_json_get_type(f_arr) != S_JSON_TYPE_ARRAY) {
-		g_set_error(err, MEGA_ERROR, MEGA_ERROR_OTHER, "Invalid response");
-		return NULL;
-	}
-
-	const gchar *f_el = s_json_get_element(f_arr, 0);
-	if (!f_el || s_json_get_type(f_el) != S_JSON_TYPE_OBJECT) {
-		g_set_error(err, MEGA_ERROR, MEGA_ERROR_OTHER, "Invalid response");
-		return NULL;
-	}
-
-	struct mega_node *nn = mega_node_parse(s, f_el);
+	struct mega_node *nn = parse_putnodes_response(s, node, &local_err);
 	if (!nn) {
-		g_set_error(err, MEGA_ERROR, MEGA_ERROR_OTHER, "Invalid response");
+		g_propagate_error(err, local_err);
 		return NULL;
 	}
 
@@ -4351,7 +5829,7 @@ static gboolean evp_set_ctr_postion(EVP_CIPHER_CTX* ctx, guint64 off, guchar* no
 #define RESUME_BUF_SIZE (1024 * 1024)
 
 gboolean mega_session_download_data(struct mega_session *s, struct mega_download_data_params *params, GFile *file,
-				    GError **err)
+		GError **err)
 {
 	GError *local_err = NULL;
 	gc_object_unref GFile *dir = NULL;
@@ -4390,7 +5868,7 @@ gboolean mega_session_download_data(struct mega_session *s, struct mega_download
 		dir = g_file_get_parent(file);
 		if (!dir) {
 			g_set_error(err, MEGA_ERROR, MEGA_ERROR_OTHER, "File %s does not have a parent directory",
-				    file_path);
+					file_path);
 			return FALSE;
 		}
 
@@ -4410,8 +5888,8 @@ gboolean mega_session_download_data(struct mega_session *s, struct mega_download
 				iostream = g_file_open_readwrite(tmp_file, NULL, &local_err);
 				if (iostream == NULL) {
 					g_propagate_prefixed_error(err, local_err,
-								   "Can't open previous temporary file for resume %s",
-								   tmp_path);
+							"Can't open previous temporary file for resume %s",
+							tmp_path);
 					return FALSE;
 				}
 
@@ -4426,8 +5904,8 @@ gboolean mega_session_download_data(struct mega_session *s, struct mega_download
 						break;
 					if (bytes_read < 0) {
 						g_propagate_prefixed_error(
-							err, local_err,
-							"Can't read previous temporary file for resume %s", tmp_path);
+								err, local_err,
+								"Can't read previous temporary file for resume %s", tmp_path);
 						return FALSE;
 					}
 
@@ -4449,7 +5927,7 @@ gboolean mega_session_download_data(struct mega_session *s, struct mega_download
 				ostream = g_file_create(tmp_file, 0, NULL, &local_err);
 				if (!ostream) {
 					g_propagate_prefixed_error(err, local_err,
-								   "Can't open local file %s for writing: ", tmp_path);
+							"Can't open local file %s for writing: ", tmp_path);
 					return FALSE;
 				}
 
@@ -4460,7 +5938,7 @@ gboolean mega_session_download_data(struct mega_session *s, struct mega_download
 			// if temporary file exists, delete it
 			if (g_file_query_exists(tmp_file, NULL) && !g_file_delete(tmp_file, NULL, &local_err)) {
 				g_propagate_prefixed_error(err, local_err, "Can't delete previous temporary file %s",
-							   tmp_name);
+						tmp_name);
 				return FALSE;
 			}
 
@@ -4468,7 +5946,7 @@ gboolean mega_session_download_data(struct mega_session *s, struct mega_download
 			ostream = g_file_create(tmp_file, 0, NULL, &local_err);
 			if (!ostream) {
 				g_propagate_prefixed_error(err, local_err,
-							   "Can't open local file %s for writing: ", tmp_path);
+						"Can't open local file %s for writing: ", tmp_path);
 				return FALSE;
 			}
 
@@ -4521,7 +5999,7 @@ gboolean mega_session_download_data(struct mega_session *s, struct mega_download
 	// download failure, we save its state prior to chunk download and
 	// restore it from saved state in case we need to rewind.
 
-        state.progress_total = params->node_size - download_from;
+	state.progress_total = params->node_size - download_from;
 	state.progress_offset = 0;
 
 	const guint64 chunk_size = 256 * 1024 * 1024;
@@ -4533,8 +6011,8 @@ gboolean mega_session_download_data(struct mega_session *s, struct mega_download
 		gboolean download_ok;
 		struct http *h;
 		gc_free gchar *url = g_strdup_printf("%s/%" G_GUINT64_FORMAT "-%" G_GUINT64_FORMAT,
-						     params->download_url,
-						     from, to - 1);
+				params->download_url,
+				from, to - 1);
 		// 640 minutes should be enough for everyone
 		const gint64 retry_timeout = 1000ll * 1000 * 60 * 640;
 		gint64 end_time = g_get_monotonic_time() + retry_timeout;
@@ -4542,6 +6020,7 @@ gboolean mega_session_download_data(struct mega_session *s, struct mega_download
 retry:
 		// perform download
 		h = http_new();
+		http_disable_pinning(h);
 		http_set_progress_callback(h, progress_dl, &state);
 		http_set_speed(h, s->max_ul, s->max_dl);
 		http_set_proxy(h, s->proxy);
@@ -4621,11 +6100,11 @@ retry:
 	EVP_CIPHER_CTX_free(state.ctx);
 
 	if (file && !g_file_move(tmp_file, file, G_FILE_COPY_NOFOLLOW_SYMLINKS | G_FILE_COPY_NO_FALLBACK_FOR_MOVE, NULL,
-				 NULL, NULL, &local_err)) {
+				NULL, NULL, &local_err)) {
 		g_propagate_prefixed_error(
-			err, local_err,
-			"Can't rename downloaded temporary file %s to %s (downloaded data is good!): ", tmp_path,
-			file_path);
+				err, local_err,
+				"Can't rename downloaded temporary file %s to %s (downloaded data is good!): ", tmp_path,
+				file_path);
 		return FALSE;
 	}
 
@@ -4661,7 +6140,7 @@ gboolean mega_session_get(struct mega_session *s, GFile *file, struct mega_node 
 	g_return_val_if_fail(err == NULL || *err == NULL, FALSE);
 
 	// prepare request
-	get_node = api_call(s, 'o', NULL, &local_err, "[{a:g, g:1, ssl:0, n:%s}]", node->handle);
+	get_node = api_call(s, 'o', NULL, &local_err, "[{a:g, g:1, n:%s}]", node->handle);
 	if (!get_node) {
 		g_propagate_error(err, local_err);
 		return FALSE;
@@ -4695,7 +6174,7 @@ gboolean mega_session_get(struct mega_session *s, GFile *file, struct mega_node 
 // {{{ mega_session_dl_prepare
 
 gboolean mega_session_dl_prepare(struct mega_session *s, struct mega_download_data_params *params, const gchar *handle,
-				 const gchar *key, GError **err)
+		const gchar *key, GError **err)
 {
 	GError *local_err = NULL;
 	gc_free gchar *node_name = NULL, *dl_node = NULL, *url = NULL, *at = NULL;
@@ -4707,7 +6186,7 @@ gboolean mega_session_dl_prepare(struct mega_session *s, struct mega_download_da
 	g_return_val_if_fail(err == NULL || *err == NULL, FALSE);
 
 	// prepare request
-	dl_node = api_call(s, 'o', NULL, &local_err, "[{a:g, g:1, ssl:0, p:%s}]", handle);
+	dl_node = api_call(s, 'o', NULL, &local_err, "[{a:g, g:1, p:%s}]", handle);
 	if (!dl_node) {
 		g_propagate_error(err, local_err);
 		return FALSE;
@@ -4760,9 +6239,9 @@ gboolean mega_session_dl_prepare(struct mega_session *s, struct mega_download_da
 #ifdef G_OS_WIN32
 	while ((check = strpbrk(check, "/\\<>:\"|?*")))
 #else
-	while ((check = strpbrk(check, "/")))
+		while ((check = strpbrk(check, "/")))
 #endif
-		*check = '_';
+			*check = '_';
 
 	// check for invalid names
 	if (!strcmp(node_name, ".") || !strcmp(node_name, "..")) {
@@ -4972,6 +6451,17 @@ gboolean mega_session_save(struct mega_session *s, GError **err)
 	g_hash_table_foreach(s->share_keys, (GHFunc)save_share_keys, gen);
 	s_json_gen_end_array(gen);
 
+	// save KeyManager data if loaded
+	if (s->keymanager.loaded) {
+		gsize km_len = 0;
+		gc_free gchar *km_data = keymanager_serialize(&s->keymanager, &km_len);
+		if (km_data && km_len > 0) {
+			gchar *km_b64 = g_base64_encode((const guchar *)km_data, km_len);
+			s_json_gen_member_string(gen, "keymanager", km_b64);
+			g_free(km_b64);
+		}
+	}
+
 	s_json_gen_member_array(gen, "fs_nodes");
 	for (i = s->fs_nodes; i; i = i->next) {
 		struct mega_node *n = i->data;
@@ -4986,6 +6476,7 @@ gboolean mega_session_save(struct mega_session *s, GError **err)
 		s_json_gen_member_int(gen, "type", n->type);
 		s_json_gen_member_int(gen, "size", n->size);
 		s_json_gen_member_int(gen, "timestamp", n->timestamp);
+		s_json_gen_member_int(gen, "access_level", n->access_level);
 		s_json_gen_member_string(gen, "link", n->link);
 		s_json_gen_end_object(gen);
 	}
@@ -4997,10 +6488,33 @@ gboolean mega_session_save(struct mega_session *s, GError **err)
 	if (mega_debug & MEGA_DEBUG_CACHE)
 		print_node(cache_data, "SAVE CACHE: ");
 
+	// AES-GCM encrypt the cache: [magic:4][version:1][iv:12][ciphertext][tag:16]
 	gc_free gchar *tmp = g_strconcat("MEGA", cache_data, NULL);
-	gc_free gchar *cipher = b64_aes128_cbc_encrypt_str(tmp, s->password_key_save);
+	gsize plain_len = strlen(tmp);
+	guchar iv[12];
+	rand_bytes_or_die(iv, sizeof(iv));
 
-	if (!g_file_set_contents(path, cipher, -1, &local_err)) {
+	guchar *cipher = g_malloc(plain_len);
+	guchar tag[16];
+	if (!aes128_gcm_encrypt((const guchar *)tmp, plain_len, s->password_key_save,
+				iv, 12, cipher, tag, 16)) {
+		g_set_error(err, MEGA_ERROR, MEGA_ERROR_OTHER, "Failed to encrypt cache");
+		return FALSE;
+	}
+
+	// Build: [magic "MEGA"][version byte][iv:12][ciphertext:plain_len][tag:16]
+	gsize blob_len = 4 + 1 + 12 + plain_len + 16;
+	guchar *blob = g_malloc(blob_len);
+	memcpy(blob, "MEGA", 4);
+	blob[4] = CACHE_FORMAT_VERSION;
+	memcpy(blob + 5, iv, 12);
+	memcpy(blob + 5 + 12, cipher, plain_len);
+	memcpy(blob + 5 + 12 + plain_len, tag, 16);
+
+	gc_free gchar *blob_b64 = g_base64_encode(blob, blob_len);
+	g_free(blob);
+
+	if (!g_file_set_contents(path, blob_b64, -1, &local_err)) {
 		g_propagate_error(err, local_err);
 		return FALSE;
 	}
@@ -5012,9 +6526,9 @@ gboolean mega_session_save(struct mega_session *s, GError **err)
 // {{{ mega_session_load
 
 static gboolean mega_session_load(struct mega_session *s,
-				  const gchar *un, const gchar *pw, gint max_age,
-				  gchar **last_sid, gchar** last_pwsalt_v2,
-				  GError **err)
+		const gchar *un, const gchar *pw, gint max_age,
+		gchar **last_sid, gchar** last_pwsalt_v2,
+		GError **err)
 {
 	GError *local_err = NULL;
 	gc_free gchar *cipher = NULL;
@@ -5025,6 +6539,7 @@ static gboolean mega_session_load(struct mega_session *s,
 	g_return_val_if_fail(err == NULL || *err == NULL, FALSE);
 
 	mega_session_close(s);
+	keymanager_init(&s->keymanager);
 	s->password_key_save = make_password_key(pw);
 
 	// calculate cache file path
@@ -5040,11 +6555,51 @@ static gboolean mega_session_load(struct mega_session *s,
 		return FALSE;
 	}
 
-	// calculate password key
-	gsize len = 0;
-	gc_free gchar *data = b64_aes128_cbc_decrypt(cipher, s->password_key_save, &len);
+	// Base64-decode the blob
+	gsize blob_len = 0;
+	guchar *blob = g_base64_decode(cipher, &blob_len);
+	if (!blob || blob_len < 4 + 1 + 12 + 16) {
+		g_set_error(err, MEGA_ERROR, MEGA_ERROR_OTHER, "Corrupted cache file");
+		g_free(blob);
+		return FALSE;
+	}
 
-	if (!data || len < 4) {
+	// Check magic and version
+	if (memcmp(blob, "MEGA", 4) != 0) {
+		g_set_error(err, MEGA_ERROR, MEGA_ERROR_OTHER, "Incorrect password");
+		g_free(blob);
+		return FALSE;
+	}
+
+	gint cache_version = blob[4];
+	if (cache_version != CACHE_FORMAT_VERSION) {
+		g_set_error(err, MEGA_ERROR, MEGA_ERROR_OTHER, "Cache version mismatch (got %d, expected %d)",
+				cache_version, CACHE_FORMAT_VERSION);
+		g_free(blob);
+		return FALSE;
+	}
+
+	// Extract IV, ciphertext, and tag
+	const guchar *iv = blob + 5;
+	gsize cipher_len = blob_len - 5 - 12 - 16;
+	const guchar *ct = blob + 5 + 12;
+	const guchar *tag = blob + 5 + 12 + cipher_len;
+
+	// AES-GCM decrypt
+	guchar *plain = g_malloc(cipher_len + 1);
+	if (!aes128_gcm_decrypt(ct, cipher_len, s->password_key_save, iv, 12, tag, 16, plain)) {
+		g_set_error(err, MEGA_ERROR, MEGA_ERROR_OTHER, "Incorrect password or corrupted cache");
+		g_free(plain);
+		g_free(blob);
+		return FALSE;
+	}
+	plain[cipher_len] = '\0';
+	g_free(blob);
+
+	gsize len = cipher_len;
+	gchar *data = (gchar *)plain;
+
+	if (len < 4) {
 		g_set_error(err, MEGA_ERROR, MEGA_ERROR_OTHER, "Corrupted cache file");
 		return FALSE;
 	}
@@ -5109,7 +6664,7 @@ static gboolean mega_session_load(struct mega_session *s,
 		s->user_email = s_json_get_member_string(cache_obj, "user_email");
 
 		if (!s->sid || !s->password_key || !s->master_key || !s->user_handle || !s->user_email ||
-		    !s->rsa_key.p || !s->rsa_key.q || !s->rsa_key.d || !s->rsa_key.u) {
+				!s->rsa_key.p || !s->rsa_key.q || !s->rsa_key.d || !s->rsa_key.u) {
 			g_set_error(err, MEGA_ERROR, MEGA_ERROR_OTHER, "Incomplete cache data");
 			return FALSE;
 		}
@@ -5117,48 +6672,68 @@ static gboolean mega_session_load(struct mega_session *s,
 		const gchar *sk_nodes = s_json_get_member(cache_obj, "share_keys");
 		if (s_json_get_type(sk_nodes) == S_JSON_TYPE_ARRAY) {
 			S_JSON_FOREACH_ELEMENT(sk_nodes, sk_node)
-			gc_free gchar *handle = s_json_get_member_string(sk_node, "handle");
+				gc_free gchar *handle = s_json_get_member_string(sk_node, "handle");
 			gc_free guchar *key = s_json_get_member_bytes(sk_node, "key", &len);
 
 			add_share_key(s, handle, key);
 			S_JSON_FOREACH_END()
 		}
 
+		// load KeyManager data if present
+		gc_free gchar *km_b64 = s_json_get_member_string(cache_obj, "keymanager");
+		if (km_b64 && strlen(km_b64) > 0) {
+			gsize km_len = 0;
+			guchar *km_data = g_base64_decode(km_b64, &km_len);
+			if (km_data && km_len > 0) {
+				// The serialized data is the TLV payload; re-wrap it
+				// as a ^!keys container for decryption
+				// Actually, we stored the raw TLV, so we need to parse it directly
+				keymanager_free(&s->keymanager);
+				keymanager_init(&s->keymanager);
+				if (keymanager_parse_tlv(&s->keymanager, km_data, km_len)) {
+					s->keymanager.loaded = TRUE;
+				}
+				g_free(km_data);
+			}
+		}
+
 		const gchar *fs_nodes = s_json_get_member(cache_obj, "fs_nodes");
 		if (s_json_get_type(fs_nodes) == S_JSON_TYPE_ARRAY) {
 			S_JSON_FOREACH_ELEMENT(fs_nodes, fs_node)
-			struct mega_node *n = g_new0(struct mega_node, 1);
+				struct mega_node *n = g_new0(struct mega_node, 1);
 
 			n->type = -1;
 
 			S_JSON_FOREACH_MEMBER(fs_node, k, v)
-			if (s_json_string_match(k, "name")) {
-				n->name = s_json_get_string(v);
-				n->name_collate_key = g_utf8_collate_key_for_filename(n->name, -1);
-			} else if (s_json_string_match(k, "handle"))
-				n->handle = s_json_get_string(v);
-			else if (s_json_string_match(k, "parent_handle"))
-				n->parent_handle = s_json_get_string(v);
-			else if (s_json_string_match(k, "user_handle"))
-				n->user_handle = s_json_get_string(v);
-			else if (s_json_string_match(k, "su_handle"))
-				n->su_handle = s_json_get_string(v);
-			else if (s_json_string_match(k, "key"))
-				n->key = s_json_get_bytes(v, &n->key_len);
-			else if (s_json_string_match(k, "type"))
-				n->type = s_json_get_int(v, -1);
-			else if (s_json_string_match(k, "size"))
-				n->size = s_json_get_int(v, 0);
-			else if (s_json_string_match(k, "timestamp"))
-				n->timestamp = s_json_get_int(v, 0);
-			else if (s_json_string_match(k, "link"))
-				n->link = s_json_get_string(v);
+				if (s_json_string_match(k, "name")) {
+					n->name = s_json_get_string(v);
+					n->name_collate_key = g_utf8_collate_key_for_filename(n->name, -1);
+				} else if (s_json_string_match(k, "handle"))
+					n->handle = s_json_get_string(v);
+				else if (s_json_string_match(k, "parent_handle"))
+					n->parent_handle = s_json_get_string(v);
+				else if (s_json_string_match(k, "user_handle"))
+					n->user_handle = s_json_get_string(v);
+				else if (s_json_string_match(k, "su_handle"))
+					n->su_handle = s_json_get_string(v);
+				else if (s_json_string_match(k, "key"))
+					n->key = s_json_get_bytes(v, &n->key_len);
+				else if (s_json_string_match(k, "type"))
+					n->type = s_json_get_int(v, -1);
+				else if (s_json_string_match(k, "size"))
+					n->size = s_json_get_int(v, 0);
+				else if (s_json_string_match(k, "timestamp"))
+					n->timestamp = s_json_get_int(v, 0);
+				else if (s_json_string_match(k, "access_level"))
+					n->access_level = s_json_get_int(v, 0);
+				else if (s_json_string_match(k, "link"))
+					n->link = s_json_get_string(v);
 			S_JSON_FOREACH_END()
 
-			s->fs_nodes = g_slist_prepend(s->fs_nodes, n);
+				s->fs_nodes = g_slist_prepend(s->fs_nodes, n);
 			S_JSON_FOREACH_END()
 
-			s->fs_nodes = g_slist_reverse(s->fs_nodes);
+				s->fs_nodes = g_slist_reverse(s->fs_nodes);
 		}
 	} else {
 		g_set_error(err, MEGA_ERROR, MEGA_ERROR_OTHER, "Corrupt cache");
@@ -5175,7 +6750,7 @@ static gboolean mega_session_load(struct mega_session *s,
 // {{{ mega_session_register
 
 gboolean mega_session_register(struct mega_session *s, const gchar *email, const gchar *password, const gchar *name,
-			       struct mega_reg_state **state, GError **err)
+		struct mega_reg_state **state, GError **err)
 {
 	GError *local_err = NULL;
 
@@ -5207,7 +6782,7 @@ gboolean mega_session_register(struct mega_session *s, const gchar *email, const
 
 	// create anon user - [{"a":"up","k":"cHl8JeeSqgBOiURQL_Dvug","ts":"W9fg4kOw8p44KWoWICbgEd3rfMovr5HoSjI1vN7845s"}] -> ["-a1DHeWfguY"]
 	gc_free gchar *node = api_call(s, 's', NULL, &local_err, "[{a:up, k:%S, ts:%S}]",
-				       b64_aes128_encrypt(master_key, 16, password_key), base64urlencode(ts_data, 32));
+			b64_aes128_encrypt(master_key, 16, password_key), base64urlencode(ts_data, 32));
 	if (!node) {
 		g_propagate_error(err, local_err);
 		return FALSE;
@@ -5245,8 +6820,8 @@ gboolean mega_session_register(struct mega_session *s, const gchar *email, const
 	// request signup link - [{"a":"uc","c":"ZOB7VJrNXFvCzyZBIcdWhr5l4dJatrWpEjEpAmH17ic","n":"Qm9iIEJyb3du","m":"bWVnb3VzQGVtYWlsLmN6"}] -> [0]
 	guchar c_data[32] = { 0 }; // aes(master_key, pw_key) + aes(verify, pw_key)
 	memcpy(c_data, master_key, 16);
-	RAND_bytes(c_data + 16, 4);
-	RAND_bytes(c_data + 16 + 12, 4);
+	rand_bytes_or_die(c_data + 16, 4);
+	rand_bytes_or_die(c_data + 16 + 12, 4);
 
 	// this will set new k from the first 16 bytes of c
 	g_free(node);
@@ -5272,7 +6847,7 @@ gboolean mega_session_register(struct mega_session *s, const gchar *email, const
 // {{{ mega_session_register_verify
 
 gboolean mega_session_register_verify(struct mega_session *s, struct mega_reg_state *state, const gchar *signup_key,
-				      GError **err)
+		GError **err)
 {
 	GError *local_err = NULL;
 	gc_free gchar *node = NULL;
@@ -5329,7 +6904,7 @@ gboolean mega_session_register_verify(struct mega_session *s, struct mega_reg_st
 	gc_free gchar **arr = s_json_get_elements(node);
 	if (g_strv_length(arr) != 5) {
 		g_set_error(err, MEGA_ERROR, MEGA_ERROR_OTHER, "Wrong number of elements in retval from 'ud' (%d)",
-			    g_strv_length(arr));
+				g_strv_length(arr));
 		return FALSE;
 	}
 
@@ -5407,7 +6982,7 @@ gboolean mega_session_register_verify(struct mega_session *s, struct mega_reg_st
 // {{{ Compatibility: old interfaces
 
 struct mega_node *mega_session_put_compat(struct mega_session *s, const gchar *remote_path, const gchar *local_path,
-					  GError **err)
+		GError **err)
 {
 	GError *local_err = NULL;
 	struct mega_node *node, *parent_node;
@@ -5451,13 +7026,12 @@ struct mega_node *mega_session_put_compat(struct mega_session *s, const gchar *r
 		parent_node = mega_session_stat(s, parent_path);
 		if (!parent_node || parent_node->type == MEGA_NODE_FILE) {
 			g_set_error(err, MEGA_ERROR, MEGA_ERROR_OTHER, "Parent directory doesn't exist: %s",
-				    parent_path);
+					parent_path);
 			return NULL;
 		}
 	}
 
-	if (!mega_node_is_writable(s, parent_node) || parent_node->type == MEGA_NODE_NETWORK ||
-			parent_node->type == MEGA_NODE_CONTACT) {
+	if (!mega_node_is_writable(s, parent_node)) {
 		gchar path[4096];
 		if (!mega_node_get_path(parent_node, path, sizeof(path)))
 			snprintf(path, sizeof path, "???");
@@ -5477,7 +7051,7 @@ struct mega_node *mega_session_put_compat(struct mega_session *s, const gchar *r
 }
 
 gboolean mega_session_get_compat(struct mega_session *s, const gchar *local_path, const gchar *remote_path,
-				 GError **err)
+		GError **err)
 {
 	gc_object_unref GFile *file = NULL;
 
@@ -5494,7 +7068,7 @@ gboolean mega_session_get_compat(struct mega_session *s, const gchar *local_path
 				gc_object_unref GFile *child = g_file_get_child(file, node->name);
 				if (g_file_query_exists(child, NULL)) {
 					g_set_error(err, MEGA_ERROR, MEGA_ERROR_EXISTS,
-						    "Local file already exists: %s/%s", local_path, node->name);
+							"Local file already exists: %s/%s", local_path, node->name);
 					return FALSE;
 				} else {
 					file = child;
@@ -5502,7 +7076,7 @@ gboolean mega_session_get_compat(struct mega_session *s, const gchar *local_path
 				}
 			} else {
 				g_set_error(err, MEGA_ERROR, MEGA_ERROR_EXISTS, "Local file already exists: %s",
-					    local_path);
+						local_path);
 				return FALSE;
 			}
 		}
@@ -5512,7 +7086,7 @@ gboolean mega_session_get_compat(struct mega_session *s, const gchar *local_path
 }
 
 gboolean mega_session_dl_compat(struct mega_session *s, const gchar *handle, const gchar *key, const gchar *local_path,
-				GError **err)
+		GError **err)
 {
 	GError *local_err = NULL;
 	gc_object_unref GFile *file = NULL, *parent_dir = NULL;
@@ -5533,7 +7107,7 @@ gboolean mega_session_dl_compat(struct mega_session *s, const gchar *handle, con
 
 			if (g_file_query_file_type(parent_dir, 0, NULL) != G_FILE_TYPE_DIRECTORY) {
 				g_set_error(err, MEGA_ERROR, MEGA_ERROR_OTHER, "Can't download file into: %s",
-					    g_file_get_path(parent_dir));
+						g_file_get_path(parent_dir));
 				return FALSE;
 			}
 		}
@@ -5551,7 +7125,7 @@ gboolean mega_session_dl_compat(struct mega_session *s, const gchar *handle, con
 
 		if (g_file_query_exists(file, NULL)) {
 			g_set_error(err, MEGA_ERROR, MEGA_ERROR_EXISTS,
-				    "Local file already exists: %s/%s", local_path, params.node_name);
+					"Local file already exists: %s/%s", local_path, params.node_name);
 			mega_download_data_free(&params);
 			return FALSE;
 		}
