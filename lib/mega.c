@@ -3294,14 +3294,17 @@ static struct mega_node *mega_node_parse(struct mega_session *s, const gchar *no
 
 			if (s->user_handle && !strcmp(s->user_handle, key_handle)) {
 				// we found a key encrypted by me
+				g_free(encrypted_node_key);
 				encrypted_node_key = g_strdup(key_value);
 				node_share_key = s->master_key;
 				break;
 			}
 
-			node_share_key = g_hash_table_lookup(s->share_keys, key_handle);
-			if (node_share_key) {
+			gchar *share_key = g_hash_table_lookup(s->share_keys, key_handle);
+			if (share_key) {
+				g_free(encrypted_node_key);
 				encrypted_node_key = g_strdup(key_value);
+				node_share_key = share_key;
 			}
 		}
 	}
